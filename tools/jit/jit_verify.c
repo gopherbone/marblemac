@@ -138,9 +138,15 @@ static void ophist_count(uc_engine *u, uint32_t a, uint32_t size)
         if (ophist_enc && a >= T_CODE + 0x4000) {
                 /* exact encodings of block code (not the shared area), open addressing */
                 uint32_t key = size == 4 ? (uint32_t)h1 << 16 | h2 : 0xFFFF0000u | h1;
-                uint32_t i = (key * 0x9e3779b1u) >> 18;
+                static uint32_t used;
+                uint32_t i = (key * 0x9e3779b1u) >> 16;
                 while (ophist_enc[i].n && ophist_enc[i].key != key)
-                        i = (i + 1) & 16383;
+                        i = (i + 1) & 65535;
+                if (!ophist_enc[i].n) {
+                        if (used >= 49152)
+                                return;         /* (full: keep what's there) */
+                        used++;
+                }
                 ophist_enc[i].key = key;
                 ophist_enc[i].n++;
         }
@@ -156,12 +162,12 @@ static void ophist_report(void)
 {
         if (ophist_enc) {
                 FILE *o = fopen(getenv("OPHIST_ENC"), "a");
-                for (int i = 0; i < 16384; i++)
+                for (int i = 0; i < 65536; i++)
                         if (ophist_enc[i].n)
                                 fprintf(o, "%08x %llu\n", ophist_enc[i].key, (unsigned long long)ophist_enc[i].n);
                 fprintf(o, "--\n");
                 fclose(o);
-                memset(ophist_enc, 0, 16384 * sizeof *ophist_enc);
+                /* (counts accumulate over the run) */
         }
         uint64_t n = 0, b = 0;
         for (int k = 0; k < 11; k++) n += ophist[k][0], b += ophist[k][1];
@@ -1216,7 +1222,7 @@ int main(int argc, char **argv)
         if (getenv("SIM")) {
                 ophist_on = getenv("OPHIST") != NULL;
                 if (ophist_on && getenv("OPHIST_ENC"))
-                        ophist_enc = calloc(16384, sizeof *ophist_enc);
+                        ophist_enc = calloc(65536, sizeof *ophist_enc);
                 cache_init(&icache, 16384, 2);
                 cache_init(&dcache, 16384, 4);
                 uc_hook_add(uc, &h7, UC_HOOK_CODE, sim_fetch, NULL, 1, 0);
