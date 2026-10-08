@@ -488,6 +488,12 @@ static uint32_t get_sr_j(void)
                (m68ki_cpu.m_flag << 11) | m68ki_cpu.int_mask | ccr;
 }
 
+/* For native routines: the SR the 68k would see now */
+uint32_t m68k_jit_get_sr(void)
+{
+        return get_sr_j();
+}
+
 /* One instruction at pc through Musashi */
 static uint32_t h_interp(uint32_t pc, uint32_t b)
 {

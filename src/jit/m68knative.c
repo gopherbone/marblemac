@@ -1480,6 +1480,184 @@ static uint32_t gne_mid(jregs_t *j, uint32_t pc, uint32_t *ninstr)
         return next;
 }
 
+/* GetOSEvent(mask D0, event record A0) when the event queue is empty
+ * (and $184 is clear): a null event with the time, mouse and modifiers.
+ * The SR save and restore leave everything as it was (the native is
+ * atomic anyway), so only the saved SR word on the stack shows.
+ * Otherwise stops before the SR is touched.
+ *
+ *  4027ec  bsr     $402764             402746  move.l  $16a.w, ($6,A0)
+ *  402764  lea     $14a.w, A1          40274c  move.l  $830.w, ($a,A0)
+ *  402768  move    SR, -(A7)           402752  move.w  $17a.w, D1
+ *  40276a  ori     #$100, SR           402756  rol.w   #1, D1
+ *  40276e  move.l  ($2,A1), D1         402758  move.b  D1, ($e,A0)
+ *  402772  beq     $402782             40275c  move.b  $172.w, ($f,A0)
+ *  402782  and.w   $144.w, D0          402762  rts
+ *  402786  tst.w   $184.w              4027e0  move    (A7)+, SR
+ *  40278a  beq     $4027dc             4027e2  clr.w   (A0)
+ *  4027dc  bsr     $402746             4027e4  clr.l   ($2,A0)
+ *                                      4027e8  moveq   #-$1, D0
+ *                                      4027ea  rts
+ *                                      4027f0  bne     $4027fc
+ *                                      4027fc  rts
+ */
+static uint32_t get_os_event(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t s = A(7);
+        push32(j, 0x4027f0);
+        A(1) = 0x14a;
+        if (rd32(0x14c) || rd16(0x184)) {
+                *ninstr = 2;
+                return 0x402768;
+        }
+        A(7) -= 2;
+        wr16(A(7), m68k_jit_get_sr());
+        uint32_t a0 = A(0);
+        push32(j, 0x4027e0);
+        wr32(a0 + 6, rd32(0x16a));
+        wr32(a0 + 0xa, rd32(0x830));
+        uint32_t d1 = rd16(0x17a);
+        d1 = (d1 << 1 | d1 >> 15) & 0xffff;             /* rol.w #1 */
+        D(1) = d1;
+        wr8(a0 + 0xe, d1);
+        wr8(a0 + 0xf, rd8(0x172));
+        wr16(a0, 0);
+        wr32(a0 + 2, 0);
+        D(0) = 0xffffffffu;
+        flags_moveq(j, -1);                             /* (X as restored) */
+        A(7) = s + 4;
+        *ninstr = 24;
+        return rd32(s);
+}
+
+/* GetMouse(&pt), up to its GlobalToLocal trap.
+ *
+ *  410fa0  movea.l ($4,A7), A1         410f68  move.w  $8de.w, D0
+ *  410fa4  move.l  $830.w, (A1)        410f6c  beq     $410f9e
+ *  410fa8  moveq   #$1, D1             410f9e  rts
+ *  410faa  bsr     $410f68
+ *  410fac  move.l  ($4,A7), -(A7)
+ *  410fb0  _GlobalToLocal
+ */
+static uint32_t get_mouse(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t pt = rd32(A(7) + 4);
+        A(1) = pt;
+        wr32(pt, rd32(0x830));
+        D(1) = 1;
+        push32(j, 0x410fac);
+        uint32_t jf = rd16(0x8de);
+        set_w(&D(0), jf);
+        flags_logic(j, jf, 2);
+        if (jf) {
+                *ninstr = 6;
+                return 0x410f6e;
+        }
+        A(7) += 4;
+        push32(j, pt);
+        flags_logic(j, pt, 4);
+        *ninstr = 8;
+        return 0x410fb0;
+}
+
+/* CheckUpdate(&event), between its traps: walk WindowList for a visible
+ * window whose update region isn't empty (EmptyRgn is a trap, so each
+ * visible window means a trip out and back).
+ *
+ *  4114e8  link    A6, #-$8            411550  move.l  ($90,A3), D0
+ *  4114ec  move.l  A3, -(A7)           411554  bne     $4114fe
+ *  4114ee  clr.w   ($c,A6)             411556  _SetPort
+ *  4114f2  subq.w  #4, A7              411558  movea.l (A7)+, A3
+ *  4114f4  move.l  A7, -(A7)           41155a  unlk    A6
+ *  4114f6  _GetPort                    41155c  move.l  (A7)+, (A7)
+ *  4114f8  move.l  $9d6.w, D0          41155e  rts
+ *  4114fc  beq     $411556
+ *  4114fe  movea.l D0, A3
+ *  411500  tst.b   ($6e,A3)
+ *  411504  beq     $411550
+ *  411506  subq.w  #2, A7
+ *  411508  move.l  ($7a,A3), -(A7)
+ *  41150c  _EmptyRgn
+ *  41150e  tst.b   (A7)+
+ *  411510  bne     $411550
+ *  411512  ...     (an update to report)
+ */
+static uint32_t check_update(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        uint32_t n = 0, d0 = 0;
+        pc &= 0xffffff;
+        if (pc == 0x4114e8) {
+                push32(j, A(6));
+                A(6) = A(7);
+                A(7) -= 8;
+                push32(j, A(3));
+                wr16(A(6) + 0xc, 0);
+                A(7) -= 4;
+                uint32_t sp = A(7);
+                push32(j, sp);
+                flags_logic(j, sp, 4);
+                *ninstr = 5;
+                return 0x4114f6;
+        }
+        if (pc == 0x411558) {
+                A(3) = rd32(A(7));
+                A(7) = A(6);
+                A(6) = rd32(A(7));
+                A(7) += 4;
+                uint32_t ret = rd32(A(7));
+                A(7) += 4;
+                wr32(A(7), ret);
+                flags_logic(j, ret, 4);
+                *ninstr = 4;
+                return rts(j);
+        }
+        if (pc == 0x4114f8) {
+                d0 = rd32(0x9d6);
+                D(0) = d0;
+                flags_logic(j, d0, 4);
+                n = 2;
+        } else {                                        /* 41150e */
+                uint32_t b = rd8(A(7));
+                A(7) += 2;
+                flags_logic(j, b, 1);
+                n = 2;
+                if (!b) {
+                        *ninstr = n;
+                        return 0x411512;
+                }
+                goto next;
+        }
+        for (;;) {
+                if (!d0) {
+                        *ninstr = n;
+                        return 0x411556;
+                }
+                A(3) = d0;
+                uint32_t vis = rd8(d0 + 0x6e);
+                flags_logic(j, vis, 1);
+                n += 3;
+                if (vis) {
+                        A(7) -= 2;
+                        uint32_t rgn = rd32(A(3) + 0x7a);
+                        push32(j, rgn);
+                        flags_logic(j, rgn, 4);
+                        *ninstr = n + 2;
+                        return 0x41150c;
+                }
+next:
+                d0 = rd32(A(3) + 0x90);
+                D(0) = d0;
+                flags_logic(j, d0, 4);
+                n += 2;
+                if (n >= LOOP_CAP && d0) {
+                        *ninstr = n;
+                        return 0x4114fe;
+                }
+        }
+}
+
 /* SystemTask: walk the unit table for drivers that are open, not busy
  * and want periodic time.  Skips entries that don't qualify; at one that
  * does, stops just after its test (415dc2), leaving the ROM to run it.
@@ -2259,6 +2437,12 @@ const m68k_native_t m68k_natives[] = {
         { 0x41108e, gne_mid, "GetNextEvent (to CheckUpdate)" },
         { 0x4110b0, gne_mid, "GetNextEvent (to GetMouse)" },
         { 0x411136, gne_mid, "GetNextEvent (exit)" },
+        { 0x4027ec, get_os_event, "GetOSEvent (queue empty)" },
+        { 0x410fa0, get_mouse, "GetMouse (to GlobalToLocal)" },
+        { 0x4114e8, check_update, "CheckUpdate (to GetPort)" },
+        { 0x4114f8, check_update, "CheckUpdate (window walk)" },
+        { 0x41150e, check_update, "CheckUpdate (after EmptyRgn)" },
+        { 0x411558, check_update, "CheckUpdate (exit)" },
         { 0x413f10, find_ref_id, "find resource ID" },
         { 0x413f1e, find_type, "find resource type" },
         { 0x415dac, unit_scan, "SystemTask driver scan" },

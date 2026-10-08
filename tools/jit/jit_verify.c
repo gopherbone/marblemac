@@ -918,6 +918,9 @@ static uint32_t plat_run(void *entry, void *code, jregs_t *regs)
                         fprintf(stderr, "MISMATCH block %06x (%u instrs):%s\n", s0.pc, n, why);
                         if (n <= 40)
                                 disasm_block(s0.pc, n);
+                        if (getenv("MUSPCS"))   /* the pcs Musashi went through */
+                                for (uint32_t k = 0; k < nmus_pcs; k++)
+                                        fprintf(stderr, "  mus %4u %06x\n", k, mus_pcs[k]);
                         if (blk_pc) {
                                 /* Walk the JIT's block entries against Musashi's pcs */
                                 uint32_t m = 0;

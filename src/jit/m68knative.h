@@ -34,5 +34,7 @@ int     m68k_native_lookup(uint32_t pc);
 /* Memory access for natives (size 1, 2 or 4); writes check for translated code */
 uint32_t m68k_jit_read(uint32_t addr, int size);
 void    m68k_jit_write(uint32_t addr, uint32_t v, int size);
+/* The status register (the register file's flags and the CPU's mode bits) */
+uint32_t m68k_jit_get_sr(void);
 
 #endif
