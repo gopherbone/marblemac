@@ -281,9 +281,15 @@ static uint32_t h_codewrite(uint32_t a, uint32_t b) { return check_write(a, b); 
  * OS runs in supervisor mode, so that's all there is to it; anything
  * unusual goes to Musashi.
  */
+static uint32_t aline_dispatch(uint32_t sp, int alt, uint32_t *ninstr);
+static uint32_t mv_read(uint32_t a, int lng);
+static void mv_write(uint32_t a, uint32_t v, int lng);
+int m68k_jit_no_native;         /* testing: run the ROM code instead */
+
 static uint32_t h_aline(uint32_t pc, uint32_t b)
 {
         (void)b;
+        J->native_n = 0;
         if (m68ki_cpu.s_flag != SFLAG_SET || m68ki_cpu.t1_flag || m68ki_cpu.t0_flag) {
                 m68k_jit_sync_out();
                 REG_PPC = pc;
@@ -301,7 +307,129 @@ static uint32_t h_aline(uint32_t pc, uint32_t b)
         a7 -= 2;
         cpu_write_word(a7 & 0xffffff, sr);
         J->dar[15] = a7;
-        return cpu_read_long((m68ki_cpu.vbr + 0x28) & 0xffffff);
+        uint32_t vec = cpu_read_long((m68ki_cpu.vbr + 0x28) & 0xffffff);
+        if ((vec == 0x401f52 || vec == 0x401f4a) && !m68k_jit_no_native) {
+                uint32_t n;
+                uint32_t to = aline_dispatch(a7, vec == 0x401f4a, &n);
+                J->native_n = n;
+                m68k_jit_stats.native_calls++;
+                m68k_jit_stats.native_instrs += n;
+                return to;
+        }
+        return vec;
+}
+
+/* The ROM's trap dispatcher (Plus v3), entered with the A-line exception
+ * frame (SR, then the trap's own address) at sp; does what its 68k code
+ * does up to the jump into the trap's routine, and says how many
+ * instructions that was.  The A-line vector points at 401f52; 401f4a
+ * (alt) is the other way in.
+ *
+ *  401f4a  move.l  ($2,A7), ($4,A7)        401f88  lea     $400.w, A2
+ *  401f50  bra     $401f54                 401f8c  bclr    #$8, D2
+ *  401f52  subq.l  #2, A7
+ *  401f54  movem.l D1-D2/A2, -(A7)         401f90  bne     $401fac
+ *  401f58  movea.l ($10,A7), A2            401f92  lsl.w   #2, D2
+ *  401f5c  move.w  (A2)+, D2               401f94  movea.l (A2,D2.w), A2
+ *  401f5e  move.l  A2, ($10,A7)            401f98  movem.l A0-A1, -(A7)
+ *  401f62  move.w  D2, D1                  401f9c  jsr     (A2)
+ *  401f64  andi.w  #$1ff, D2               ...
+ *  401f68  cmpi.w  #-$5800, D1             401fac  lsl.w   #2, D2
+ *  401f6c  bcs     $401f88                 401fae  movea.l (A2,D2.w), A2
+ *  401f6e  lea     $c00.w, A2              401fb2  move.l  A1, -(A7)
+ *  401f72  lsl.w   #2, D2                  401fb4  jsr     (A2)
+ *  401f74  move.l  (A2,D2.w), ($c,A7)
+ *  401f7a  cmpi.w  #-$5400, D1
+ *  401f7e  movem.l (A7)+, D1-D2/A2
+ *  401f82  bcs     $401f86
+ *  401f84  move.l  (A7)+, (A7)
+ *  401f86  rts
+ */
+static uint32_t aline_dispatch(uint32_t sp, int alt, uint32_t *ninstr)
+{
+#define RD16(a)         mv_read((a) & 0xffffff, 0)
+#define RD32(a)         mv_read((a) & 0xffffff, 1)
+#define WR32(a, v)      mv_write((a) & 0xffffff, (v), 1)
+        uint32_t d1 = J->dar[1], d2 = J->dar[2], a2 = J->dar[10];
+        uint32_t n = alt ? 2 : 1;               /* move.l + bra, or subq */
+        if (alt)
+                WR32(sp + 4, RD32(sp + 2));
+        else
+                sp -= 2;
+        sp -= 12;
+        WR32(sp, d1);
+        WR32(sp + 4, d2);
+        WR32(sp + 8, a2);
+        a2 = RD32(sp + 16);
+        uint32_t trap = RD16(a2);
+        a2 += 2;
+        WR32(sp + 16, a2);
+        uint32_t idx = trap & 0x1ff;
+        if (trap >= 0xa800) {
+                /* Toolbox: the routine's address replaces the frame's SR
+                 * word, and the RTS goes there (one return address
+                 * further up for auto-pop traps).
+                 */
+                idx = (idx << 2) & 0xffff;              /* lsl.w #2: X = bit 14 = 0 */
+                J->x = 0;
+                WR32(sp + 12, RD32(0xc00 + (uint32_t)(int16_t)idx));
+                uint32_t res = trap - 0xac00;           /* cmpi.w #$ac00, D1 */
+                J->n = (res >> 8) & 0xff;
+                J->not_z = res & 0xffff;
+                J->v = ((0xac00 ^ trap) & (res ^ trap)) >> 8 & 0x80;
+                J->c = (res >> 8) & 0x100;
+                sp += 12;                               /* movem restores D1/D2/A2 */
+                n += 15;
+                if (trap >= 0xac00) {
+                        uint32_t v = RD32(sp);          /* move.l (A7)+, (A7) */
+                        sp += 4;
+                        WR32(sp, v);
+                        J->n = v >> 24;
+                        J->not_z = v;
+                        J->v = J->c = 0;
+                        n++;
+                }
+                uint32_t to = RD32(sp);
+                J->dar[15] = sp + 4;
+                *ninstr = n;
+                return to;
+        }
+        /* OS: D1 = the trap word, D2 = its table offset, and the routine
+         * returns into the dispatcher, which restores registers.
+         */
+        int keep_a0 = idx & 0x100;                      /* bclr #8; bne */
+        idx &= 0xff;
+        uint32_t off = idx << 2;                        /* lsl.w #2: C/X = bit 14 = 0 */
+        J->x = J->c = 0;
+        J->v = 0;
+        J->n = (off >> 8) & 0x80;
+        J->not_z = off;
+        a2 = RD32(0x400 + off);
+        uint32_t ret;
+        if (!keep_a0) {
+                sp -= 8;
+                WR32(sp, J->dar[8]);
+                WR32(sp + 4, J->dar[9]);
+                ret = 0x401f9e;
+        } else {
+                sp -= 4;
+                WR32(sp, J->dar[9]);                    /* move.l A1, -(A7) */
+                J->n = J->dar[9] >> 24;
+                J->not_z = J->dar[9];
+                J->c = 0;
+                ret = 0x401fb6;
+        }
+        sp -= 4;
+        WR32(sp, ret);
+        J->dar[1] = (d1 & 0xffff0000u) | trap;
+        J->dar[2] = (d2 & 0xffff0000u) | off;
+        J->dar[10] = a2;
+        J->dar[15] = sp;
+        *ninstr = n + 15;
+        return a2;
+#undef RD16
+#undef RD32
+#undef WR32
 }
 
 uint32_t m68k_jit_helper(int n, uint32_t a, uint32_t b)
@@ -1927,8 +2055,6 @@ static int tr_rts(tctx_t *t)
         return 1;
 }
 
-int m68k_jit_no_native;         /* testing: run the ROM code instead */
-
 /* Block for a native ROM routine: call it, charge what it says the ROM
  * code would have taken, and go on at the pc it returns.  (Flags are
  * already in Musashi's format at a block start.)
@@ -1950,6 +2076,9 @@ static int tr_aline(tctx_t *t)
         emit_flush_flags(t);            /* the helper builds SR from them */
         t_mov32(E, R0, t->pc);
         call_helper(t, JH_ALINE);
+        /* (plus the dispatcher's instructions, if it did those natively) */
+        t_ldr(E, R1, R4, JR_OFF(native_n));
+        t_sub(E, R7, R7, R1);
         emit_exit_reg(t, R0, t->count + 1);
         return 1;
 }
