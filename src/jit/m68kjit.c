@@ -1676,9 +1676,17 @@ static int tr_moveq(tctx_t *t, uint32_t op)
         if (op & 0x100)
                 return -1;
         int32_t v = (int8_t)(op & 0xff);
-        t_mov32(E, R0, (uint32_t)v);
+        /* N and Z from a flag-setting move; V and C come out as 0 for
+         * F_LOGIC whatever ARM's are
+         */
+        if (v >= 0) {
+                t_movs8(E, R0, v);
+        } else {
+                t_movs8(E, R0, ~v);
+                t16(E, 0x43C0 | R0 << 3 | R0);  /* mvns r0, r0 */
+        }
+        emit_flags(t, F_LOGIC, 0);
         t_str(E, R0, R4, OFF_D(op >> 9 & 7));
-        emit_flags_const(t, v < 0, v == 0, 0, 0);
         return 0;
 }
 
@@ -1815,8 +1823,8 @@ static int tr_unary(tctx_t *t, uint32_t op, int kind)
         if (kind == 0) {                        /* CLR */
                 /* (flags first: the store must be the last thing we do) */
                 if (mode == EA_D) {
-                        emit_flags_const(t, 0, 1, 0, 0);
-                        t_mov32(E, R0, 0);
+                        t_movs8(E, R0, 0);
+                        emit_flags(t, F_LOGIC, 0);
                         emit_write_dreg(t, r, size, R0);
                 } else {
                         emit_ea_addr(t, mode, r, size, R0);
