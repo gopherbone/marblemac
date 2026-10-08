@@ -8,6 +8,10 @@
  *
  * Drawn as a black line with a white halo so it shows on any background;
  * slack rope sags downhill (a quadratic bezier), taut rope is straight.
+ * The sag follows the tilt smoothed over a fraction of a second, and only
+ * hangs fully once the console is tilted properly: held nearly flat, a
+ * long rope just lies in a loose curve instead of flapping about with
+ * every wobble.
  *
  * While anchored, the arrow hangs from its tip (where the rope ties on) as
  * a damped physical pendulum; see bungee_arrow().
@@ -26,7 +30,13 @@
 static PlaydateAPI *pd;
 static int active;
 static float anc_x, anc_y, rest;
-static float sag_gx, sag_gy = 1;
+static float sag_gx, sag_gy = 1;       /* downhill, unit vector */
+static float sag_w;                     /* how much it hangs, 0 (flat) .. 1 */
+static float sg_x, sg_y;                /* smoothed tilt acceleration */
+
+#define SAG_SMOOTH      0.3f    /* s, time constant for following the tilt */
+#define SAG_FULL_TILT   0.25f   /* fraction of full tilt for a full hang (~15 deg) */
+#define SAG_FLAT        0.3f    /* depth of the curve when lying flat, vs hanging */
 
 void bungee_init(PlaydateAPI *playdate)
 {
@@ -81,10 +91,17 @@ void bungee_input(PDButtons cur, PDButtons pushed, int panel_open, float dt,
 
 void bungee_apply(float px, float py, float *vx, float *vy, float gx, float gy, float dt)
 {
-        float gl = sqrtf(gx * gx + gy * gy);
-        if (gl > 1.0f) {
-                sag_gx = gx / gl;
-                sag_gy = gy / gl;
+        if (dt > 0) {
+                float a = 1 - expf(-dt / SAG_SMOOTH);
+                sg_x += (gx - sg_x) * a;
+                sg_y += (gy - sg_y) * a;
+                float gl = sqrtf(sg_x * sg_x + sg_y * sg_y);
+                if (gl > 1.0f) {
+                        sag_gx = sg_x / gl;
+                        sag_gy = sg_y / gl;
+                }
+                float w = fminf(1, gl / (SAG_FULL_TILT * fmaxf(tune.tilt_gain, 1)));
+                sag_w = w * w * (3 - 2 * w);
         }
         if (!active || dt <= 0)
                 return;
@@ -283,6 +300,7 @@ void bungee_draw(uint8_t *frame, int rowbytes, int width, int height,
         if (slack > 0.5f) {
                 float h = sqrtf(3 * d * slack / 8 + slack * slack / 4);
                 h = fminf(h, rest / 2);
+                h *= SAG_FLAT + (1 - SAG_FLAT) * sag_w;
                 float sx = sag_gx, sy = sag_gy;
                 if (d > 1) {
                         float pxn = -dy / d, pyn = dx / d;
