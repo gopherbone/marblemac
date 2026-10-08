@@ -220,7 +220,7 @@ static void unlink_page(uint32_t p)
         for (int32_t l = page_links[p]; l >= 0; l = links[l].next) {
                 uint32_t e = (uint32_t)links[l].exit_hi << 16 | links[l].exit_lo;
                 uint16_t *slot = (uint16_t *)((char *)code_buf + exits[e].slot);
-                tbr_t b = { slot, C_AL };
+                tbr_t b = { slot, C_AL, 0 };
                 t_patch_branch(b, (uint16_t *)((char *)code_buf + (exits[e].stub & EXIT_STUB_MASK)));
                 plat->code_written(slot, 4);
         }
@@ -2264,7 +2264,7 @@ static int tr_dbcc(tctx_t *t, uint32_t op)
         int cc = op >> 8 & 15, r = op & 7;
         uint32_t target = t->pc + 2 + (int16_t)fetch16(t), next = t->fetch;
         int n = t->count + 1;
-        tbr_t cond_true = { NULL, 0 };
+        tbr_t cond_true = { NULL, 0, 0 };
         (void)next;
         if (cc == 0)
                 return 0;                       /* DBT: never loops */
@@ -3061,7 +3061,7 @@ static void link_exit(uint32_t e, uint32_t recycles)
                 page_links[pg] = nlinks++;
         }
         uint16_t *slot = (uint16_t *)((char *)code_buf + exits[e].slot);
-        tbr_t b = { slot, C_AL };
+        tbr_t b = { slot, C_AL, 0 };
         t_patch_branch(b, next->code + 1);      /* past its push */
         plat->code_written(slot, 4);
         m68k_jit_stats.chains++;

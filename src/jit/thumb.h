@@ -327,7 +327,7 @@ typedef struct {
 static inline tbr_t t_b_placeholder(temit_t *e, int cond)
 {
         t_realize(e);           /* (both paths get the flags) */
-        tbr_t b = { e->p, cond };
+        tbr_t b = { e->p, cond, 0 };
         if (e->p + 2 > e->end) { e->full = 1; return b; }
         e->p[0] = e->p[1] = 0;  /* (branches don't touch the flags) */
         e->p += 2;
