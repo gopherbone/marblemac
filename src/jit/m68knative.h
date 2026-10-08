@@ -25,11 +25,13 @@ typedef struct {
 } m68k_native_t;
 
 extern const m68k_native_t m68k_natives[];
+/* Per routine: times run and 68k instructions stood in for */
+extern struct m68k_native_stat { uint32_t calls; uint64_t instrs; } m68k_native_stats[];
 extern const int m68k_native_count;
 /* Index into m68k_natives of the routine at pc, or -1 */
 int     m68k_native_lookup(uint32_t pc);
 
-/* Memory access for natives (size 2 or 4); writes check for translated code */
+/* Memory access for natives (size 1, 2 or 4); writes check for translated code */
 uint32_t m68k_jit_read(uint32_t addr, int size);
 void    m68k_jit_write(uint32_t addr, uint32_t v, int size);
 

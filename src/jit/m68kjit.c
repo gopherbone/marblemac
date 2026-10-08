@@ -604,11 +604,25 @@ static void mv_write(uint32_t a, uint32_t v, int lng)
 /* Memory access for native routines (m68knative.c) */
 uint32_t m68k_jit_read(uint32_t addr, int size)
 {
+        if (size == 1) {
+                addr &= 0xffffff;
+                return addr & 0xc00000 ? cpu_read_byte(addr) : ram[addr];
+        }
         return mv_read(addr, size == 4);
 }
 
 void m68k_jit_write(uint32_t addr, uint32_t v, int size)
 {
+        if (size == 1) {
+                addr &= 0xffffff;
+                if (addr & 0xc00000) {
+                        cpu_write_byte(addr, v & 0xff);
+                } else {
+                        m68k_jit_note_write(addr, 1);
+                        ram[addr] = v;
+                }
+                return;
+        }
         mv_write(addr, v, size == 4);
 }
 
@@ -617,6 +631,8 @@ static uint32_t h_native(uint32_t idx, uint32_t pc)
         uint32_t n = 0;
         uint32_t next = m68k_natives[idx].fn(J, pc, &n);
         J->native_n = n;
+        m68k_native_stats[idx].calls++;
+        m68k_native_stats[idx].instrs += n;
         m68k_jit_stats.native_calls++;
         m68k_jit_stats.native_instrs += n;
         return next;

@@ -22,6 +22,42 @@ static void flags_moveq(jregs_t *j, int32_t v)
         j->c = 0;
 }
 
+static uint32_t rd8(uint32_t a) { return m68k_jit_read(a & 0xffffff, 1); }
+static void wr8(uint32_t a, uint32_t v) { m68k_jit_write(a & 0xffffff, v, 1); }
+static void wr16(uint32_t a, uint32_t v) { m68k_jit_write(a & 0xffffff, v, 2); }
+static void wr32(uint32_t a, uint32_t v) { m68k_jit_write(a & 0xffffff, v, 4); }
+
+/* Flags of move/tst/clr of size bytes (N, Z; V = C = 0; X untouched) */
+static void flags_logic(jregs_t *j, uint32_t v, int size)
+{
+        int sh = 8 * size - 8;
+        uint32_t m = size == 4 ? 0xffffffffu : (1u << (8 * size)) - 1;
+        j->n = (v >> sh) & 0x80;
+        j->not_z = v & m;
+        j->v = 0;
+        j->c = 0;
+}
+
+/* Flags of cmp src, dst (dst - src) of size bytes (X untouched) */
+static void flags_cmp(jregs_t *j, uint32_t dst, uint32_t src, int size)
+{
+        int sh = 8 * size - 8;
+        uint32_t m = size == 4 ? 0xffffffffu : (1u << (8 * size)) - 1;
+        dst &= m;
+        src &= m;
+        uint32_t res = (dst - src) & m;
+        j->n = (res >> sh) & 0x80;
+        j->not_z = res;
+        j->v = (((src ^ dst) & (res ^ dst)) >> sh) & 0x80;
+        j->c = dst < src ? 0x100 : 0;
+}
+
+static void push32(jregs_t *j, uint32_t v)
+{
+        A(7) -= 4;
+        wr32(A(7), v);
+}
+
 static uint32_t rts(jregs_t *j)
 {
         uint32_t pc = rd32(A(7));
@@ -126,6 +162,485 @@ static uint32_t find_type(jregs_t *j, uint32_t pc, uint32_t *ninstr)
         flags_moveq(j, (int32_t)D(0));
         *ninstr = n;
         return rts(j);
+}
+
+/* Resource Manager GetResource(type, id) / Get1Resource, from just after
+ * the trap patch's jmp: StdEntry, find the current map, search the map
+ * chain (FindType/GetRefList/FindID/NextMap), remember the hit, then the
+ * resource-load vector ($7F0) for a RAM map whose resource is already
+ * in memory or isn't to be loaded, and the common exit (StdExit).
+ * Rare cases (RomMapInsert, CurMap bad, ROM map, a resource that needs
+ * reading in, a patched load vector) go back to the ROM at that point.
+ *
+ *  413dee  bsr     $413f56             413e1a  bsr     $4140a8
+ *  413df2  bsr     $413e9c             413e1e  bsr     $414130
+ *  413df6  bpl     $413dfc             413e22  move.l  A0, ($e,A6)
+ *  413dfc  move.w  (A0)+, D2           413e26  move.l  A0, $b84.w
+ *  413dfe  move.l  (A0)+, D3           413e2a  bra     $413ffe
+ *  413e00  clr.l   (A0)
+ *  413e02  bsr     $413f1e   FindType
+ *  413e06  bmi     $413e12
+ *  413e08  bsr     $413f30   GetRefList
+ *  413e0c  bsr     $413f10   FindID
+ *  413e10  beq     $413e1a
+ *  413e12  bsr     $413eca   NextMap
+ *  413e16  beq     $413e02
+ *  413e18  bra     $413e2a
+ *
+ *  413f56  clr.w   $a60.w              StdEntry
+ *  413f5a  movea.l (A7)+, A0
+ *  413f5c  link    A6, #-$32
+ *  413f60  clr.w   (-$1c,A6)
+ *  413f64  clr.w   (-$18,A6)
+ *  413f68  move.b  $ba4.w, (-$17,A6)
+ *  413f6e  movem.l D1-D7/A1-A4, -(A7)
+ *  413f72  suba.l  A4, A4
+ *  413f74  move.l  A0, -(A7)
+ *  413f76  lea     ($8,A6), A0
+ *  413f7a  tst.b   $b9e.w
+ *  413f7e  beq     $413f84
+ *  413f84  rts
+ *
+ *  413e9c  move.w  $a5a.w, D6          CurMap's map -> A4, A3, A2
+ *  413ea0  tst.w   D6
+ *  413ea2  bmi     $413f4a
+ *  413ea6  bne     $413eac
+ *  413ea8  move.w  $a58.w, D6
+ *  413eac  movea.l $a50.w, A4
+ *  413eb0  moveq   #$0, D0
+ *  413eb2  bra     $413ebe
+ *  413eb4  move.l  ($10,A3), D0
+ *  413eb8  beq     $413f4a
+ *  413ebc  exg     D0, A4
+ *  413ebe  movea.l (A4), A3
+ *  413ec0  cmp.w   ($14,A3), D6
+ *  413ec4  bne     $413eb4
+ *  413ec6  movea.l A3, A2
+ *  413ec8  rts
+ *
+ *  413f30  move.w  ($4,A2), D4         GetRefList
+ *  413f34  move.l  D0, -(A7)
+ *  413f36  moveq   #$0, D0
+ *  413f38  move.w  ($6,A2), D0
+ *  413f3c  movea.l D0, A2
+ *  413f3e  move.l  (A7)+, D0
+ *  413f40  adda.l  A3, A2
+ *  413f42  rts
+ *
+ *  413eca  tst.b   $b9a.w              NextMap
+ *  413ece  beq     $413ed4
+ *  413ed0  suba.l  A4, A4
+ *  413ed2  bra     $413eda
+ *  413ed4  movea.l (A4), A3
+ *  413ed6  movea.l ($10,A3), A4
+ *  413eda  move.l  A4, D0
+ *  413edc  beq     $413f4a
+ *  413ede  movea.l (A4), A3
+ *  413ee0  move.w  ($14,A3), D6
+ *  413ee4  bra     $413f46
+ *  413f46  moveq #0, D0; rts           413f4a  moveq #-1, D0; rts
+ *
+ *  4140a8  move.w  $a06.w, $b9c.w      remember the hit
+ *  4140ae  move.l  (A4), D0
+ *  4140b0  suba.l  D0, A2
+ *  4140b2  suba.l  D0, A3
+ *  4140b4  movem.l D3/A1-A4, $b80.w
+ *  4140ba  movem.w D4-D6, $b94.w
+ *  4140c0  adda.l  D0, A2
+ *  4140c2  adda.l  D0, A3
+ *  4140c4  rts
+ *
+ *  414130  movea.l $7f0.w, A0          load vector
+ *  414134  jmp     (A0)
+ *  414136  move.b  ($4,A2), D1         (the ROM's load routine)
+ *  41413a  cmpa.l  $b06.w, A4
+ *  41413e  beq     $414102
+ *  414140  move.l  $118.w, -(A7)
+ *  414144  btst    #$6, D1
+ *  414148  beq     $414150
+ *  41414a  move.l  $2a6.w, $118.w
+ *  414150  movea.l ($8,A2), A0
+ *  414154  suba.l  (A4), A3
+ *  414156  tst.b   $a5e.w
+ *  41415a  beq     $41419e
+ *  41415c  move.l  A0, D0
+ *  41415e  bne     $41417a
+ *  41417a  tst.l   (A0)
+ *  41417c  bne     $4141a8
+ *  41419e  move.l  A0, D0
+ *  4141a0  bne     $4141a8
+ *  4141a8  move.l  A0, D0
+ *  4141aa  beq     $4141b0
+ *  4141ac  move.l  A0, ($8,A2)
+ *  4141b0  adda.l  (A4), A3
+ *  4141b2  move.l  (A7)+, $118.w
+ *  4141b6  rts
+ *
+ *  413ffe  moveq   #$6, D0             StdExit
+ *  414000  bra     $41400c
+ *  41400c  tst.b   $b9e.w
+ *  414010  beq     $414018
+ *  414018  clr.b   $b9a.w
+ *  41401c  clr.w   $b9e.w
+ *  414020  clr.b   $ba4.w
+ *  414024  movem.l (A7)+, D1-D7/A1-A4
+ *  414028  unlk    A6
+ *  41402a  movea.l (A7)+, A0
+ *  41402c  adda.l  D0, A7
+ *  41402e  move.l  A0, -(A7)
+ *  414030  suba.l  A0, A0
+ *  414032  move.w  $a60.w, D0
+ *  414036  beq     $414040
+ *  414038  move.l  $af2.w, -(A7)
+ *  41403c  bne     $414040
+ *  41403e  addq.w  #4, A7
+ *  414040  rts
+ */
+static uint32_t get_resource(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t n, sub, b;
+        /* StdEntry */
+        push32(j, 0x413df2);                            /* bsr */
+        wr16(0xa60, 0);
+        A(0) = rd32(A(7));
+        A(7) += 4;
+        push32(j, A(6));                                /* link */
+        A(6) = A(7);
+        A(7) -= 0x32;
+        wr16(A(6) - 0x1c, 0);
+        wr16(A(6) - 0x18, 0);
+        b = rd8(0xba4);
+        wr8(A(6) - 0x17, b);
+        for (int r = 12; r >= 1; r--)                   /* movem D1-D7/A1-A4 */
+                if (r != 8)
+                        push32(j, j->dar[r]);
+        A(4) = 0;
+        push32(j, A(0));
+        A(0) = A(6) + 8;
+        b = rd8(0xb9e);
+        flags_logic(j, b, 1);
+        n = 13;
+        if (b) {
+                *ninstr = n;
+                return 0x413f80;
+        }
+        A(7) += 4;                                      /* rts */
+        n++;
+
+        /* Find the current map */
+        push32(j, 0x413df6);
+        uint32_t d6 = rd16(0xa5a);
+        set_w(&D(6), d6);
+        flags_logic(j, d6, 2);
+        n += 4;                                         /* bsr, move, tst, bmi */
+        if (d6 & 0x8000) {
+                *ninstr = n;
+                return 0x413f4a;
+        }
+        n++;                                            /* bne */
+        if (!d6) {
+                d6 = rd16(0xa58);
+                set_w(&D(6), d6);
+                n++;
+        }
+        A(4) = rd32(0xa50);
+        D(0) = 0;
+        n += 3;                                         /* movea, moveq, bra */
+        for (;;) {
+                A(3) = rd32(A(4));
+                uint32_t w = rd16(A(3) + 0x14);
+                flags_cmp(j, d6, w, 2);
+                n += 3;                                 /* movea, cmp, bne */
+                if (w == d6)
+                        break;
+                D(0) = rd32(A(3) + 0x10);
+                flags_logic(j, D(0), 4);
+                n += 2;                                 /* move, beq */
+                if (!D(0)) {
+                        *ninstr = n;
+                        return 0x413f4a;
+                }
+                uint32_t t = D(0);
+                D(0) = A(4);
+                A(4) = t;
+                n++;                                    /* exg */
+        }
+        A(2) = A(3);
+        A(7) += 4;
+        n += 3;                                         /* movea, rts, bpl */
+
+        /* Arguments */
+        set_w(&D(2), rd16(A(0)));
+        A(0) += 2;
+        D(3) = rd32(A(0));
+        A(0) += 4;
+        wr32(A(0), 0);
+        flags_logic(j, 0, 4);
+        n += 3;
+
+        /* Search the map chain */
+        int found;
+        for (;;) {
+                push32(j, 0x413e06);
+                find_type(j, 0x413f1e, &sub);
+                n += 2 + sub;                           /* bsr, ..., bmi */
+                if (!(D(0) & 0x80000000u)) {
+                        push32(j, 0x413e0c);            /* bsr GetRefList */
+                        uint32_t a2 = A(2);
+                        set_w(&D(4), rd16(a2 + 4));
+                        push32(j, D(0));
+                        D(0) = rd16(a2 + 6);
+                        A(2) = D(0);
+                        D(0) = rd32(A(7));
+                        A(7) += 4;
+                        flags_logic(j, D(0), 4);
+                        A(2) += A(3);
+                        A(7) += 4;                      /* rts */
+                        n += 9;
+                        push32(j, 0x413e10);
+                        find_ref_id(j, 0x413f10, &sub);
+                        n += 2 + sub;                   /* bsr, ..., beq */
+                        if (!D(0)) {
+                                found = 1;
+                                break;
+                        }
+                }
+                /* NextMap */
+                push32(j, 0x413e16);
+                b = rd8(0xb9a);
+                if (b)
+                        A(4) = 0;
+                else {
+                        A(3) = rd32(A(4));
+                        A(4) = rd32(A(3) + 0x10);
+                }
+                D(0) = A(4);
+                flags_logic(j, D(0), 4);
+                n += 7;                                 /* bsr, tst, beq, 2, move, beq */
+                if (!A(4)) {
+                        D(0) = 0xffffffffu;
+                        flags_moveq(j, -1);
+                        A(7) += 4;
+                        n += 4;                         /* moveq, rts, beq, bra */
+                        found = 0;
+                        break;
+                }
+                A(3) = rd32(A(4));
+                d6 = rd16(A(3) + 0x14);
+                set_w(&D(6), d6);
+                D(0) = 0;
+                flags_moveq(j, 0);
+                A(7) += 4;
+                n += 6;                                 /* movea, move, bra, moveq, rts, beq */
+        }
+
+        if (found) {
+                /* Remember it */
+                push32(j, 0x413e1e);
+                wr16(0xb9c, rd16(0xa06));
+                D(0) = rd32(A(4));
+                A(2) -= D(0);
+                A(3) -= D(0);
+                wr32(0xb80, D(3));
+                wr32(0xb84, A(1));
+                wr32(0xb88, A(2));
+                wr32(0xb8c, A(3));
+                wr32(0xb90, A(4));
+                wr16(0xb94, D(4));
+                wr16(0xb96, D(5));
+                wr16(0xb98, D(6));
+                flags_logic(j, D(0), 4);
+                A(2) += D(0);
+                A(3) += D(0);
+                A(7) += 4;
+                n += 10;                                /* bsr + 9 */
+
+                /* The load vector */
+                push32(j, 0x413e22);
+                A(0) = rd32(0x7f0);
+                n += 3;                                 /* bsr, movea, jmp */
+                if ((A(0) & 0xffffff) != 0x414136) {
+                        *ninstr = n;
+                        return A(0);
+                }
+                b = rd8(A(2) + 4);
+                D(1) = (D(1) & 0xffffff00u) | b;
+                uint32_t rm = rd32(0xb06);
+                flags_cmp(j, A(4), rm, 4);
+                n += 3;
+                if (A(4) == rm) {
+                        *ninstr = n;
+                        return 0x414102;
+                }
+                uint32_t save118 = rd32(0x118);
+                push32(j, save118);
+                flags_logic(j, save118, 4);
+                j->not_z = b & 0x40;                    /* btst */
+                n += 3;
+                if (b & 0x40) {
+                        uint32_t v = rd32(0x2a6);
+                        wr32(0x118, v);
+                        flags_logic(j, v, 4);
+                        n++;
+                }
+                A(0) = rd32(A(2) + 8);
+                A(3) -= rd32(A(4));
+                b = rd8(0xa5e);
+                n += 4;                                 /* movea, suba, tst, beq */
+                D(0) = A(0);
+                flags_logic(j, D(0), 4);
+                n += 2;                                 /* move, bne */
+                if (b) {
+                        if (!A(0)) {
+                                *ninstr = n;
+                                return 0x414160;
+                        }
+                        flags_logic(j, rd32(A(0)), 4);
+                        n += 2;                         /* tst, bne */
+                        if (!j->not_z) {
+                                *ninstr = n;
+                                return 0x41417e;
+                        }
+                } else if (!A(0)) {
+                        *ninstr = n;
+                        return 0x4141a2;
+                }
+                D(0) = A(0);
+                wr32(A(2) + 8, A(0));
+                A(3) += rd32(A(4));
+                uint32_t v = rd32(A(7));
+                A(7) += 4;
+                wr32(0x118, v);
+                A(7) += 4;                              /* rts */
+                n += 6;
+
+                wr32(A(6) + 0xe, A(0));
+                wr32(0xb84, A(0));
+                flags_logic(j, A(0), 4);
+                n += 3;                                 /* move, move, bra */
+        } else
+                n++;                                    /* bra $413ffe */
+
+        /* StdExit */
+        D(0) = 6;
+        b = rd8(0xb9e);
+        flags_logic(j, b, 1);
+        n += 4;
+        if (b) {
+                *ninstr = n;
+                return 0x414012;
+        }
+        wr8(0xb9a, 0);
+        wr16(0xb9e, 0);
+        wr8(0xba4, 0);
+        for (int r = 1; r <= 12; r++)
+                if (r != 8) {
+                        j->dar[r] = rd32(A(7));
+                        A(7) += 4;
+                }
+        A(7) = A(6);                                    /* unlk */
+        A(6) = rd32(A(7));
+        A(7) += 4;
+        uint32_t ret = rd32(A(7));
+        A(7) += 4 + 6;
+        push32(j, ret);
+        A(0) = 0;
+        uint32_t err = rd16(0xa60);
+        D(0) = err;
+        flags_logic(j, err, 2);
+        n += 11;                                        /* clr x3 .. beq */
+        if (err) {
+                uint32_t proc = rd32(0xaf2);
+                push32(j, proc);
+                flags_logic(j, proc, 4);
+                n += 2;
+                if (!proc) {
+                        A(7) += 4;
+                        n++;
+                }
+        }
+        *ninstr = n + 1;                                /* rts */
+        return rts(j);
+}
+
+/* SetCursor's body: copy the 16+16 longs of image and mask to TheCrsr
+ * ($844), clamp the hot spot to 0..16 and store it at $886 ($884 long),
+ * counting changes in D1.  If anything changed, carry on in the ROM
+ * (hide and show the cursor); otherwise return.  The Finder calls it
+ * with the same cursor every time round its loop.
+ *
+ *  401e0a  movea.l ($8,A7), A0         401e24  move.l  ($e,A7), D0
+ *  401e0e  lea     $844.w, A1          401e28  moveq   #$10, D2
+ *  401e12  moveq   #$f, D2             401e2a  cmp.w   D2, D0
+ *  401e14  moveq   #$0, D1             401e2c  bls     $401e30
+ *  401e16  move.l  (A0)+, D0           401e2e  move.w  D2, D0
+ *  401e18  cmp.l   (A1), D0            401e30  swap    D0
+ *  401e1a  beq     $401e1e             401e32  cmp.w   D2, D0
+ *  401e1c  addq.w  #1, D1              401e34  bls     $401e38
+ *  401e1e  move.l  D0, (A1)+           401e36  move.w  D2, D0
+ *  401e20  dbra    D2, $401e16         401e38  swap    D0
+ *                                      401e3a  cmp.l   $884.w, D0
+ *                                      401e3e  beq     $401e46
+ *                                      401e40  addq.w  #1, D1
+ *                                      401e42  move.l  D0, $884.w
+ *                                      401e46  tst.w   D1
+ *                                      401e48  beq     $401e52
+ *                                      401e4a  ...     (hide/show)
+ *                                      401e52  movea.l (A7)+, A0
+ *                                      401e54  adda.w  #$e, A7
+ *                                      401e58  jmp     (A0)
+ */
+static uint32_t set_cursor(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t a0 = rd32(A(7) + 8), a1 = 0x844, d0, d1 = 0, n = 4;
+        for (int i = 0; i < 16; i++) {
+                d0 = rd32(a0);
+                a0 += 4;
+                if (d0 != rd32(a1)) {
+                        d1++;
+                        n++;
+                }
+                wr32(a1, d0);
+                a1 += 4;
+                n += 5;
+        }
+        d0 = rd32(A(7) + 0xe);
+        if ((d0 & 0xffff) > 0x10) {
+                d0 = (d0 & 0xffff0000u) | 0x10;
+                n++;
+        }
+        d0 = d0 << 16 | d0 >> 16;
+        if ((d0 & 0xffff) > 0x10) {
+                d0 = (d0 & 0xffff0000u) | 0x10;
+                n++;
+        }
+        d0 = d0 << 16 | d0 >> 16;
+        n += 10;
+        if (d0 != rd32(0x884)) {
+                d1++;
+                wr32(0x884, d0);
+                n += 2;
+        }
+        n += 2;                                 /* tst, beq */
+        if (d1)
+                j->x = 0;                       /* addq.w #1, D1 (from 0..17) */
+        flags_logic(j, d1, 2);
+        D(0) = d0;
+        D(1) = d1;
+        D(2) = 0x10;                            /* moveq #$10 */
+        A(0) = a0;
+        A(1) = a1;
+        if (d1) {
+                *ninstr = n;
+                return 0x401e4a;
+        }
+        uint32_t ret = rd32(A(7));
+        A(0) = ret;
+        A(7) += 4 + 0xe;
+        *ninstr = n + 3;
+        return ret;
 }
 
 /* SystemTask: walk the unit table for drivers that are open, not busy
@@ -885,6 +1400,8 @@ out:
 }
 
 const m68k_native_t m68k_natives[] = {
+        { 0x413dee, get_resource, "GetResource" },
+        { 0x401e0a, set_cursor, "SetCursor" },
         { 0x413f10, find_ref_id, "find resource ID" },
         { 0x413f1e, find_type, "find resource type" },
         { 0x415dac, unit_scan, "SystemTask driver scan" },
@@ -892,6 +1409,7 @@ const m68k_native_t m68k_natives[] = {
         { 0x40a41e, bitblt_rows, "bitblt rows" },
 };
 const int m68k_native_count = sizeof m68k_natives / sizeof m68k_natives[0];
+struct m68k_native_stat m68k_native_stats[sizeof m68k_natives / sizeof m68k_natives[0]];
 
 int m68k_native_lookup(uint32_t pc)
 {

@@ -1336,14 +1336,34 @@ int main(int argc, char **argv)
                         int trials = atoi(argv[++i]);
                         blt_fuzz(trials, (uint32_t)strtoul(argv[++i], 0, 0));
                 } else if (!strcmp(argv[i], "dumpexec")) {
-                        /* per-pc execution counts (uint32, pc 0..0x41ffff), then reset */
-                        FILE *o = fopen(argv[++i], "wb");
-                        if (iexec && o) {
-                                fwrite(iexec, 4, 0x420000, o);
-                                memset(iexec, 0, 4 * 0x1000000);
+                        /* per-pc execution counts (uint32, pc 0..0x41ffff); needs "sizes" first.  Resets them. */
+                        const char *fn = argv[++i];
+                        FILE *f = iexec ? fopen(fn, "wb") : NULL;
+                        static uint64_t last_tot, last_nat, last_k[64];
+                        static uint32_t last_c[64];
+                        uint64_t tot = m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs, tabn = 0;
+                        fprintf(stderr, "[%s] %llu instrs, natives %llu (%.1f%%)\n", fn, (unsigned long long)(tot - last_tot),
+                                (unsigned long long)(m68k_jit_stats.native_instrs - last_nat),
+                                100.0 * (m68k_jit_stats.native_instrs - last_nat) / (double)(tot - last_tot));
+                        for (int k = 0; k < m68k_native_count && k < 64; k++) {
+                                uint64_t d = m68k_native_stats[k].instrs - last_k[k];
+                                tabn += d;
+                                fprintf(stderr, "   native %06x %-24s %8u calls %10llu instrs (%.2f%%, %.1f/call)\n", m68k_natives[k].pc,
+                                        m68k_natives[k].name, m68k_native_stats[k].calls - last_c[k], (unsigned long long)d,
+                                        100.0 * d / (double)(tot - last_tot), (m68k_native_stats[k].calls - last_c[k]) ? (double)d / (m68k_native_stats[k].calls - last_c[k]) : 0);
+                                last_k[k] = m68k_native_stats[k].instrs;
+                                last_c[k] = m68k_native_stats[k].calls;
                         }
-                        if (o)
-                                fclose(o);
+                        fprintf(stderr, "   native A-line dispatch %llu instrs (%.1f%%)\n",
+                                (unsigned long long)(m68k_jit_stats.native_instrs - last_nat - tabn),
+                                100.0 * (m68k_jit_stats.native_instrs - last_nat - tabn) / (double)(tot - last_tot));
+                        last_tot = tot;
+                        last_nat = m68k_jit_stats.native_instrs;
+                        if (f) {
+                                fwrite(iexec, 4, 0x420000, f);
+                                fclose(f);
+                                memset(iexec, 0, 0x1000000 * 4);
+                        }
                 } else if (!strcmp(argv[i], "traps")) {
                         if (!trapprof_on) {
                                 trapprof_on = 1;
@@ -1362,6 +1382,9 @@ int main(int argc, char **argv)
                 }
         }
         report("end");
+        for (int k = 0; k < m68k_native_count; k++)
+                fprintf(stderr, "  native %06x %-24s %8u calls %10llu instrs\n", m68k_natives[k].pc, m68k_natives[k].name,
+                        m68k_native_stats[k].calls, (unsigned long long)m68k_native_stats[k].instrs);
         flush_report();
         return mismatches != 0;
 }
