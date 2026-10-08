@@ -123,6 +123,11 @@ static int jit_stress(PlaydateAPI *pd, int n, int gap, int far_read)
 {
         uint32_t span = n * (256 + gap) + 64;
         uint16_t *buf = pd->system->realloc(NULL, span);
+        if (!buf) {
+                /* (next to a 4MB Mac the heap runs out after a few rounds) */
+                pd->system->logToConsole("bench: stress: no memory for %lu bytes", (unsigned long)span);
+                return -1;
+        }
         uint16_t *p = (uint16_t *)(((uintptr_t)buf + 31) & ~31u);
         prefill(p, (span - 64) / 2);
         static uint16_t *fn[2048];
