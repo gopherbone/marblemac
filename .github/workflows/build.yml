@@ -20,11 +20,11 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Cache Playdate SDK and Arm toolchain
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/PlaydateSDK
@@ -61,7 +61,7 @@ jobs:
           mkdir dist
           zip -r dist/marblemac.pdx.zip marblemac.pdx
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: marblemac.pdx
           path: dist/marblemac.pdx.zip
@@ -73,7 +73,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: marblemac.pdx
       - name: Publish release
