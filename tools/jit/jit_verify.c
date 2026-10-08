@@ -20,6 +20,7 @@
 #include "rom.h"
 #include "m68k.h"
 #include "m68kjit.h"
+#include "m68knative.h"
 #include "macglue.h"
 
 /* Musashi internals we compare */
@@ -607,6 +608,156 @@ static int flag_bits(const m68ki_cpu_core *c)
                (c->not_z_flag ? 0 : 4) | ((c->v_flag & 0x80) ? 2 : 0) | ((c->c_flag & 0x100) ? 1 : 0);
 }
 
+/* ---- bltfuzz: the bitblt row native against the ROM, on made-up rows ----
+ * Sets up random rows for each of bitblt's transfer loops (registers, the
+ * link frame, pattern table, bitmaps) in scratch RAM, runs the native at
+ * $40a41e, then Musashi for the same instruction count from the same
+ * state, and compares registers, flags, pc and all of RAM.
+ */
+static uint32_t fz_state = 1;
+static uint32_t fz_rand(void)
+{
+        fz_state ^= fz_state << 13;
+        fz_state ^= fz_state >> 17;
+        fz_state ^= fz_state << 5;
+        return fz_state;
+}
+
+static void blt_fuzz(int trials, uint32_t seed)
+{
+        static const uint32_t tgts[] = {
+                0x40a4c8, 0x40a4c6, 0x40a548, 0x40a546, 0x40a566, 0x40a564, 0x40a584, 0x40a582,
+                0x40a4a4, 0x40a4b0, 0x40a470, 0x40a5c6, 0x40a5e6, 0x40a678, 0x40a684, 0x40a694,
+                0x40a666, 0x40a664, 0x40a6fc, 0x40a6fa, 0x40a5a2,
+        };
+        int idx = m68k_native_lookup(0x40a41e);
+        if (idx < 0) {
+                fprintf(stderr, "bltfuzz: no native at 40a41e\n");
+                return;
+        }
+        fz_state = seed ? seed : 1;
+        uint8_t *orig = malloc(RAM_SIZE), *save = malloc(RAM_SIZE), *after = malloc(RAM_SIZE);
+        m68ki_cpu_core cpu0;
+        memcpy(&cpu0, &m68ki_cpu, sizeof cpu0);
+        memcpy(orig, ram, RAM_SIZE);
+        int bad = 0, capped = 0, fallback = 0;
+        uint64_t instrs = 0;
+        const uint32_t BUF = 0x300000, A6 = 0x340000, SP = 0x348000;
+        for (int t = 0; t < trials && bad < 10; t++) {
+                for (uint32_t a = BUF - 0x10000; a < SP + 0x100; a += 4) {
+                        uint32_t r = fz_rand();
+                        ram[a] = r >> 24; ram[a + 1] = r >> 16; ram[a + 2] = r >> 8; ram[a + 3] = r;
+                }
+                uint32_t tgt = tgts[fz_rand() % (sizeof tgts / sizeof tgts[0])];
+                int big = fz_rand() % 8 == 0;
+                uint32_t d2w = big ? fz_rand() % 80 : fz_rand() % 40;
+                if (fz_rand() % 16 == 0)
+                        d2w = 0x10000 - fz_rand() % 40;                 /* negative: should fall back or be harmless */
+                if (tgt == 0x40a470 && d2w == 0)
+                        d2w = 1;
+                uint32_t rows = fz_rand() % 10 == 0 ? 50 + fz_rand() % 200 : fz_rand() % 6;
+                jregs_t j;
+                memset(&j, 0, sizeof j);
+                for (int i = 0; i < 16; i++)
+                        j.dar[i] = fz_rand();
+                j.dar[3] = (j.dar[3] & 0xffff0000) | rows;
+                j.dar[8] = fz_rand() & 1 ? 2 : 0xfffffffe;              /* A0 */
+                j.dar[9] = tgt;                                         /* A1 */
+                if (fz_rand() % 3 == 0)
+                        j.dar[6] &= 15;                                 /* shift */
+                int16_t sb = (int16_t)((fz_rand() % 129) * 2 - 128), db = (int16_t)((fz_rand() % 129) * 2 - 128);
+                j.dar[11] = (j.dar[11] & 0xffff0000) | (uint16_t)db;    /* A3: dst bump */
+                uint32_t span = (rows + 1) * 200 + 2 * ((d2w & 0xff) + 4);
+                j.dar[12] = BUF + 0x8000 + (fz_rand() % 0x4000) * 2;    /* A4 */
+                j.dar[13] = fz_rand() % 4 == 0 ? j.dar[12] + (int)(fz_rand() % 64) - 32
+                                               : BUF + 0x8000 + span + (fz_rand() % 0x4000) * 2;
+                if (fz_rand() % 16 == 0)
+                        j.dar[13] |= 1;                                 /* odd */
+                if (fz_rand() % 16 == 0)
+                        j.dar[12] |= 1;
+                j.dar[14] = A6;
+                j.dar[15] = SP;
+                /* A2: a proper unrolled entry for the loops that use it */
+                uint32_t base = tgt == 0x40a4b0 ? 0x40a4ea : tgt == 0x40a5e6 ? 0x40a608 : tgt == 0x40a684 ? 0x40a69e : 0;
+                if (base && fz_rand() % 8) {
+                        int16_t w = (int16_t)d2w;
+                        uint32_t a2 = base;
+                        if (w <= 0x20)
+                                a2 += 0x39 + ((w & 1) ? 0 : 0x21) - w;
+                        j.dar[10] = a2;
+                }
+                ram[A6 - 0x4e] = d2w >> 8; ram[A6 - 0x4d] = d2w;
+                ram[A6 - 0x4a] = (uint16_t)sb >> 8; ram[A6 - 0x49] = sb;
+                j.x = fz_rand() & 0x100; j.n = fz_rand() & 0x80; j.not_z = fz_rand() & 1;
+                j.v = fz_rand() & 0x80; j.c = fz_rand() & 0x100;
+                j.pc = 0x40a41e;
+
+                /* Musashi's starting state */
+                m68ki_cpu_core c;
+                memcpy(&c, &cpu0, sizeof c);
+                for (int i = 0; i < 16; i++)
+                        c.dar[i] = j.dar[i];
+                c.x_flag = j.x; c.n_flag = j.n; c.not_z_flag = j.not_z; c.v_flag = j.v; c.c_flag = j.c;
+                c.int_mask = 0x700;
+                memcpy(save, ram, RAM_SIZE);
+
+                jregs_t in = j;
+                uint32_t n = 0;
+                uint32_t next = m68k_natives[idx].fn(&j, 0x40a41e, &n);
+                j.pc = next;
+                memcpy(after, ram, RAM_SIZE);
+                memcpy(ram, save, RAM_SIZE);
+                instrs += n;
+                if (next == 0x40a41e)
+                        capped++;
+                if (n == 3 && next == tgt)
+                        fallback++;
+
+                memcpy(&m68ki_cpu, &c, sizeof c);
+                m68k_set_reg(M68K_REG_PC, 0x40a41e);
+                for (uint32_t i = 0; i < n; i++)
+                        m68k_step_one();
+                int ok = 1;
+                for (int i = 0; i < 16; i++)
+                        if (j.dar[i] != m68ki_cpu.dar[i])
+                                ok = 0;
+                if (j.pc != m68ki_cpu.pc || jflag_bits(&j) != flag_bits(&m68ki_cpu))
+                        ok = 0;
+                uint32_t memdiff = 0xffffffff;
+                if (memcmp(after, ram, RAM_SIZE)) {
+                        ok = 0;
+                        for (uint32_t a = 0; a < RAM_SIZE; a++)
+                                if (after[a] != ram[a]) {
+                                        memdiff = a;
+                                        break;
+                                }
+                }
+                if (!ok) {
+                        bad++;
+                        fprintf(stderr, "bltfuzz %d: tgt %06x d2w %u rows %u n %u A0 %08x A2 %08x D6 %08x\n",
+                                t, tgt, d2w, rows, n, in.dar[8], in.dar[10], in.dar[6]);
+                        for (int i = 0; i < 16; i++)
+                                if (j.dar[i] != m68ki_cpu.dar[i])
+                                        fprintf(stderr, "   %c%d native=%08x mus=%08x\n", i < 8 ? 'D' : 'A', i & 7,
+                                                j.dar[i], m68ki_cpu.dar[i]);
+                        fprintf(stderr, "   PC native=%06x mus=%06x  XNZVC native=%02x mus=%02x\n",
+                                j.pc, m68ki_cpu.pc, jflag_bits(&j), flag_bits(&m68ki_cpu));
+                        if (memdiff != 0xffffffff)
+                                fprintf(stderr, "   mem[%06x] native=%02x mus=%02x\n", memdiff, after[memdiff], ram[memdiff]);
+                }
+                memcpy(ram, save, RAM_SIZE);
+        }
+        memcpy(&m68ki_cpu, &cpu0, sizeof cpu0);
+        memcpy(ram, orig, RAM_SIZE);
+        fprintf(stderr, "bltfuzz: %d trials, %llu instrs, %d capped, %d fallback, %d BAD\n",
+                trials, (unsigned long long)instrs, capped, fallback, bad);
+        if (bad)
+                mismatches += bad;
+        free(orig);
+        free(save);
+        free(after);
+}
+
 static void disasm_block(uint32_t pc, int n)
 {
         char buf[100];
@@ -1141,6 +1292,20 @@ int main(int argc, char **argv)
                         for (int k = 1; k <= 20; k++)
                                 frame(x + (tx - x) * k / 20, y + (ty - y) * k / 20, 0);
                         x = tx; y = ty;
+                } else if (!strcmp(argv[i], "d")) {
+                        /* drag: press here, glide to X Y with the button down, release */
+                        int tx = atoi(argv[++i]), ty = atoi(argv[++i]);
+                        for (int j = 0; j < 3; j++) frame(x, y, 1);
+                        for (int k = 1; k <= 20; k++)
+                                frame(x + (tx - x) * k / 20, y + (ty - y) * k / 20, 1);
+                        x = tx; y = ty;
+                        for (int j = 0; j < 3; j++) frame(x, y, 1);
+                        for (int j = 0; j < 3; j++) frame(x, y, 0);
+                } else if (!strcmp(argv[i], "hold")) {
+                        /* hold the button down here for MS */
+                        int ms = atoi(argv[++i]);
+                        for (int j = 0; j < ms / 25; j++) frame(x, y, 1);
+                        for (int j = 0; j < 3; j++) frame(x, y, 0);
                 } else if (!strcmp(argv[i], "c") || !strcmp(argv[i], "dc")) {
                         int nclick = argv[i][0] == 'd' ? 2 : 1;
                         for (int k = 0; k < nclick; k++) {
@@ -1167,6 +1332,9 @@ int main(int argc, char **argv)
                         } else {
                                 size_report();
                         }
+                } else if (!strcmp(argv[i], "bltfuzz")) {
+                        int trials = atoi(argv[++i]);
+                        blt_fuzz(trials, (uint32_t)strtoul(argv[++i], 0, 0));
                 } else if (!strcmp(argv[i], "dumpexec")) {
                         /* per-pc execution counts (uint32, pc 0..0x41ffff), then reset */
                         FILE *o = fopen(argv[++i], "wb");
