@@ -89,7 +89,7 @@ static jit_entry_t *table;
 static uint32_t gen = 1;
 static uint16_t *code_buf, *code_ptr, *code_end, *perm_end;
 /* Testing: start generated code this many bytes later, to tell code
- * layout luck from real speedups */
+ * layout luck from real speedups (m68k_jit_code_skew can override it) */
 #ifndef JIT_CODE_SKEW
 #define JIT_CODE_SKEW 0
 #endif
@@ -137,6 +137,11 @@ int m68k_jit_no_jcache;                 /* testing: never fill it */
 int m68k_jit_max_budget;                /* testing: cap instructions per run (0 = none) */
 int m68k_jit_no_traces;                 /* testing: end blocks at conditional branches */
 int m68k_jit_no_follow;                 /* testing: don't fold unconditional jumps into traces */
+/* Testing: perturb code layout (to tell real wins from cache-placement
+ * luck).  skew: bytes left empty before the first block (multiple of 2;
+ * build-time default JIT_CODE_SKEW); pad: bytes left empty after each block.
+ */
+int m68k_jit_code_skew = JIT_CODE_SKEW, m68k_jit_code_pad;
 void (*m68k_jit_size_observer)(uint32_t pc, uint32_t op, uint32_t bytes);
 
 static void jcache_clear(void)
@@ -2288,7 +2293,7 @@ static void recycle_code(void)
 {
         if (plat->recycle)
                 plat->recycle();
-        code_ptr = perm_end + JIT_CODE_SKEW / 2;
+        code_ptr = perm_end + m68k_jit_code_skew / 2;
         flush_all();
         m68k_jit_stats.recycles++;
 }
@@ -2472,7 +2477,7 @@ static uint16_t *translate(uint32_t pc, jit_entry_t *ent)
         /* (The platform's code_written evicts any stale I-cache copies of
          * these lines, including one shared with the previous block.)
          */
-        code_ptr = (uint16_t *)(((uintptr_t)t->e.p + CODE_ALIGN - 1) & ~(uintptr_t)(CODE_ALIGN - 1));
+        code_ptr = (uint16_t *)(((uintptr_t)t->e.p + m68k_jit_code_pad + CODE_ALIGN - 1) & ~(uintptr_t)(CODE_ALIGN - 1));
         m68k_jit_stats.code_bytes += (uint32_t)((char *)t->e.p - (char *)code);
         plat->code_written(code, (uint32_t)((char *)t->e.p - (char *)code));
         if (m68k_jit_translate_observer)
@@ -2692,7 +2697,7 @@ static void emit_permanent(void)
 
         perm_end = (uint16_t *)(((uintptr_t)e->p + 31) & ~(uintptr_t)31);
         plat->code_written(code_buf, (uint32_t)((char *)e->p - (char *)code_buf));
-        code_ptr = perm_end + JIT_CODE_SKEW / 2;
+        code_ptr = perm_end + m68k_jit_code_skew / 2;
 }
 
 int m68k_jit_init(const m68kjit_platform_t *p, uint8_t *r, uint32_t rsize,

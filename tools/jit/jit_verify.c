@@ -1147,6 +1147,11 @@ int main(int argc, char **argv)
         jregs_buf = aligned(0x1000);
         cpu_page = (uintptr_t)&m68ki_cpu & ~(uintptr_t)0xfff;
         cpu_page_len = (((uintptr_t)&m68ki_cpu + sizeof m68ki_cpu + 0xfff) & ~(uintptr_t)0xfff) - cpu_page;
+        extern int m68k_jit_code_skew, m68k_jit_code_pad;
+        if (getenv("SKEW"))
+                m68k_jit_code_skew = atoi(getenv("SKEW")) & ~1;
+        if (getenv("PAD"))
+                m68k_jit_code_pad = atoi(getenv("PAD"));
         if (m68k_jit_init(&plat, ram, RAM_SIZE, rom, ROM_SIZE, CODE_SIZE)) {
                 puts("jit init failed");
                 return 1;
