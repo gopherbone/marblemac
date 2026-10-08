@@ -1261,6 +1261,9 @@ int main(int argc, char **argv)
         extern int m68k_jit_relayout;
         if (getenv("RELAYOUT"))
                 m68k_jit_relayout = atoi(getenv("RELAYOUT"));
+        extern int m68k_jit_inline_rts;
+        if (getenv("NOINLRTS"))
+                m68k_jit_inline_rts = 0;
         extern int m68k_jit_defer_mrs;
         if (getenv("NODEFER"))
                 m68k_jit_defer_mrs = 0;

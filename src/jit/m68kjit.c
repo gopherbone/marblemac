@@ -146,6 +146,7 @@ int m68k_jit_no_traces;                 /* testing: end blocks at conditional br
 int m68k_jit_no_follow;                 /* testing: don't fold unconditional jumps into traces */
 int m68k_jit_exit_flag_elide = 1;       /* chained exits skip storing flags the target overwrites */
 int m68k_jit_defer_mrs = 1;             /* capture flags (MRS) only once something needs them */
+int m68k_jit_inline_rts = 1;            /* exits to an RTS do it themselves */
 /* Testing: perturb code layout (to tell real wins from cache-placement
  * luck).  skew: bytes left empty before the first block (multiple of 2;
  * build-time default JIT_CODE_SKEW); pad: bytes left empty after each block.
@@ -808,6 +809,9 @@ typedef struct {
         uint32_t follow;        /* translate_one returned 2: carry on at this pc */
         uint32_t rstart[MAX_RANGES], rend[MAX_RANGES];  /* 68k code the trace covers */
         int nranges;
+        int closed;             /* rend[nranges - 1] is the last range (not open) */
+        uint32_t xw[4];         /* single 68k words the code also depends on */
+        int nxw;
         uint32_t alu_imm;
         stub_t stubs[MAX_STUBS];
         int nstubs;
@@ -891,6 +895,7 @@ static void emit_smc_check(tctx_t *t);
 static void emit_flush_flags(tctx_t *t);
 static void emit_exit_const(tctx_t *t, uint32_t pc, int ninstr);
 static int can_follow(tctx_t *t, uint32_t target);
+static int add_word_dep(tctx_t *t, uint32_t pc);
 
 /* Store `size` bytes of rv at address ra, as the last thing the current
  * instruction does.  If the store overwrote translated code, leave the
@@ -1467,6 +1472,17 @@ static int target_kills_flags(uint32_t pc)
 static void emit_exit_const(tctx_t *t, uint32_t pc, int ninstr)
 {
         fstate_t saved = t->f;
+        if (m68k_jit_inline_rts && fetchable(pc) && peek16(pc) == 0x4e75 &&
+            (m68k_jit_no_native || m68k_native_lookup(pc) < 0) && add_word_dep(t, pc)) {
+                /* Leaving for an RTS: do the RTS here instead of jumping
+                 * to a block that just does it.
+                 */
+                emit_flush_flags(t);
+                emit_charge(t, ninstr + 1);
+                t_b_to(E, C_AL, rts_fn);
+                t->f = saved;
+                return;
+        }
         int chain = chainable(pc) && t->nstubs < MAX_STUBS && nexits < MAX_EXITS;
         int need = 0;
         if (chain && m68k_jit_exit_flag_elide && (t->f.pend != F_NONE || t->f.xpend)) {
@@ -2442,9 +2458,9 @@ static void recycle_code(void)
 static int trace_pages(const tctx_t *t, uint32_t xs, uint32_t xe, uint16_t *out)
 {
         int n = 0;
-        for (int i = 0; i <= t->nranges; i++) {
-                uint32_t s0 = i < t->nranges ? t->rstart[i] : xs;
-                uint32_t e0 = i < t->nranges ? t->rend[i] : xe;
+        for (int i = 0; i <= t->nranges + t->nxw; i++) {
+                uint32_t s0 = i < t->nranges ? t->rstart[i] : i == t->nranges ? xs : t->xw[i - t->nranges - 1];
+                uint32_t e0 = i < t->nranges ? t->rend[i] : i == t->nranges ? xe : s0 + 2;
                 s0 &= 0xffffff;
                 e0 &= 0xffffff;
                 if (s0 >= ram_size || e0 <= s0)
@@ -2483,6 +2499,11 @@ static void mark_code(const tctx_t *t, jit_entry_t *ent)
                 for (uint32_t w = start >> 1; w <= (end - 1) >> 1; w++)
                         codebits[w >> 3] |= 1 << (w & 7);
         }
+        for (int k = 0; k < t->nxw; k++) {
+                uint32_t a = t->xw[k] & 0xffffff;
+                if (a < ram_size)
+                        codebits[a >> 4] |= 1 << (a >> 1 & 7);
+        }
         for (int i = 0; i < n && i < MAX_PAGES; i++) {
                 codepage[pages[i]] = 1;
                 ent->pg[i] = pages[i];
@@ -2518,6 +2539,31 @@ static int can_follow(tctx_t *t, uint32_t target)
         return n <= MAX_PAGES;
 }
 
+/* The translation depends on the 68k word at pc (besides its ranges);
+ * returns 0 if that's more pages than a block can track.
+ */
+static int add_word_dep(tctx_t *t, uint32_t pc)
+{
+        if ((pc & 0xffffff) >= ram_size)
+                return 1;               /* ROM */
+        if (t->nxw >= 4)
+                return 0;
+        uint16_t pages[MAX_PAGES + 1];
+        int n;
+        if (!t->closed) {
+                t->rend[t->nranges] = t->fetch;
+                t->nranges++;
+                n = trace_pages(t, pc, pc + 2, pages);
+                t->nranges--;
+        } else {
+                n = trace_pages(t, pc, pc + 2, pages);
+        }
+        if (n > MAX_PAGES)
+                return 0;
+        t->xw[t->nxw++] = pc;
+        return 1;
+}
+
 /* Translate the block at pc.  Returns NULL if the first instruction isn't
  * something we handle.
  */
@@ -2540,6 +2586,8 @@ static uint16_t *translate(uint32_t pc, jit_entry_t *ent)
         t->f.r9kind = F_NONE;
         t->f.apsr = 0;
         t->nranges = 0;
+        t->closed = 0;
+        t->nxw = 0;
         t->rstart[0] = pc;
         emit_prologue(t);
         uint16_t *body = t->e.p;
@@ -2609,6 +2657,7 @@ static uint16_t *translate(uint32_t pc, jit_entry_t *ent)
                 }
         }
         t->rend[t->nranges++] = at;
+        t->closed = 1;
 
         if (t->count == 0 && t->e.p == body) {
                 for (int i = 0; i < MAX_PAGES; i++)
