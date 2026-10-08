@@ -321,6 +321,7 @@ static inline void t_nop(temit_t *e)                   { t16(e, 0xBF00); }
 typedef struct {
         uint16_t *at;
         int cond;
+        int narrow;             /* 16-bit form: B<c> T1 / B T2, forward up to 256 bytes */
 } tbr_t;
 
 static inline tbr_t t_b_placeholder(temit_t *e, int cond)
@@ -333,11 +334,36 @@ static inline tbr_t t_b_placeholder(temit_t *e, int cond)
         return b;
 }
 
+/* A short forward branch over code that's known to be small */
+static inline tbr_t t_b_placeholder_n(temit_t *e, int cond)
+{
+        t_realize(e);
+        tbr_t b = { e->p, cond, 1 };
+        if (e->p + 1 > e->end) { e->full = 1; return b; }
+        e->p[0] = 0;
+        e->p += 1;
+        return b;
+}
+
+/* Can a narrow placeholder reach target? */
+static inline int t_reaches_n(tbr_t b, uint16_t *target)
+{
+        int32_t off = (int32_t)((char *)target - ((char *)b.at + 4));
+        return off >= 0 && off < (b.cond == C_AL ? 2048 : 256);
+}
+
 static inline void t_patch_branch(tbr_t b, uint16_t *target)
 {
         uint16_t *at = b.at;
         int32_t off = (int32_t)((char *)target - ((char *)at + 4));
         uint32_t s = off < 0;
+        if (b.narrow) {
+                if (b.cond == C_AL)
+                        at[0] = 0xE000 | (off >> 1 & 0x7ff);
+                else
+                        at[0] = 0xD000 | b.cond << 8 | (off >> 1 & 0xff);
+                return;
+        }
         if (b.cond == C_AL) {
                 /* B.W T4: S:I1:I2:imm10:imm11, I1 = !(J1^S), I2 = !(J2^S) */
                 uint32_t i1 = off >> 23 & 1, i2 = off >> 22 & 1;

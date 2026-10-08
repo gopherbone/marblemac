@@ -95,6 +95,9 @@ int main(void)
         T("bhi.w .+0x40004", { tbr_t a = t_b_placeholder(e, C_HI); t_patch_branch(a, a.at + 0x20002); });
         T("b.w .+0x200004", { tbr_t a = t_b_placeholder(e, C_AL); t_patch_branch(a, a.at + 0x100002); });
         T("b.w .-0x1ffffc", { tbr_t a = t_b_placeholder(e, C_AL); t_patch_branch(a, a.at - 0xffffe); });
+        T("beq.n .+0x14", { tbr_t a = t_b_placeholder_n(e, C_EQ); t_patch_branch(a, a.at + 0xa); });
+        T("ble.n .+0x100", { tbr_t a = t_b_placeholder_n(e, C_LE); t_patch_branch(a, a.at + 0x80); });
+        T("b.n .+0x10", { tbr_t a = t_b_placeholder_n(e, C_AL); t_patch_branch(a, a.at + 0x8); });
         /* an owed MRS comes out before a flag-setting instruction, not before a load */
         T("ldr r0, [r4, #60]; mrs r9, APSR; adds.w r0, r1, r2", { e->defer = R9 + 1; t_ldr(e, R0, R4, 60); t_adds(e, R0, R1, R2); });
         T("mrs r9, APSR; bl .+0x1c", { e->defer = R9 + 1; t_bl_to(e, e->p + 0x10); });

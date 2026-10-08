@@ -1519,7 +1519,7 @@ static void emit_exit_reg(tctx_t *t, int rpc, int ninstr)
         /* Budget left: try the jump cache.  (B<cond>.W only reaches 1MB,
          * so branch over an unconditional B.W, which reaches 16MB.)
          */
-        tbr_t done = t_b_placeholder(E, C_LE);
+        tbr_t done = t_b_placeholder_n(E, C_LE);
         t_b_to(E, C_AL, dyn_jump);
         t_patch_branch(done, E->p);
         t->f.apsr = 0;
@@ -2054,7 +2054,7 @@ static int tr_shift(tctx_t *t, uint32_t op)
                 t_bici(E, R9, R9, 0x10000000);
                 t->f.apsr = 0;
                 t_cmpi(E, R2, 1);
-                tbr_t same = t_b_placeholder(E, C_LS);
+                tbr_t same = t_b_placeholder_n(E, C_LS);
                 t_orri(E, R9, R9, 0x10000000);
                 t_patch_branch(same, E->p);
                 t->f.apsr = 0;
@@ -2106,7 +2106,7 @@ static int tr_scc(tctx_t *t, uint32_t op)
                 t_mov32(E, R8, 0xff);
         } else if (cc != 1) {
                 int c = emit_cond(t, cc);
-                tbr_t skip = t_b_placeholder(E, invert_cond(c));
+                tbr_t skip = t_b_placeholder_n(E, invert_cond(c));
                 t_mov32(E, R8, 0xff);
                 t_patch_branch(skip, E->p);
                 t->f.apsr = 0;
@@ -2133,9 +2133,11 @@ static void emit_cond_exit(tctx_t *t, int c, uint32_t pc, int n)
          */
         int defer = E->defer;
         E->defer = 0;
-        tbr_t skip = t_b_placeholder(E, invert_cond(c));
+        tbr_t skip = t_b_placeholder_n(E, invert_cond(c));
         E->defer = defer;
         emit_exit_const(t, pc, n);
+        if (!t_reaches_n(skip, E->p))
+                t->fail = 1;            /* (can't happen: the exit is a few instructions) */
         t_patch_branch(skip, E->p);
         E->defer = defer;
         /* Only the branch arrives here, flags untouched */
@@ -2206,7 +2208,7 @@ static int tr_dbcc(tctx_t *t, uint32_t op)
         if (cc == 0)
                 return 0;                       /* DBT: never loops */
         if (cc != 1)
-                cond_true = t_b_placeholder(E, emit_cond(t, cc));
+                cond_true = t_b_placeholder_n(E, emit_cond(t, cc));
         t_ldr(E, R0, R4, OFF_D(r));
         t_movsh(E, 1, R1, R0, SH_LSL, 16);      /* Z: the word was 0, so it's about to expire */
         t_subi(E, R2, R0, 1);                   /* (no flags from here on) */
@@ -2214,6 +2216,8 @@ static int tr_dbcc(tctx_t *t, uint32_t op)
         t_str(E, R0, R4, OFF_D(r));
         emit_cond_exit(t, C_NE, target, n);     /* not expired: loop */
         if (cond_true.at) {
+                if (!t_reaches_n(cond_true, E->p))
+                        t->fail = 1;
                 t_patch_branch(cond_true, E->p);
                 t->f.apsr = 0;
         }
