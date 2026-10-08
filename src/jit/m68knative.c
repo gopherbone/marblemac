@@ -1659,26 +1659,26 @@ next:
 }
 
 /* SystemTask: walk the unit table for drivers that are open, not busy
- * and want periodic time.  Skips entries that don't qualify; at one that
- * does, stops just after its test (415dc2), leaving the ROM to run it.
- * Otherwise carries on after the loop (415de2).
+ * and want periodic time, and whose time has come (dCtlDelay ticks since
+ * dCtlCurTicks).  Stops at one that's due (415dd4, or 415dda with no
+ * delay), leaving the ROM to call it; otherwise carries on after the
+ * loop (415de2).
  *
- *  415dac  move.l  (A3)+, D0
- *  415dae  beq     $415dde
- *  415db0  movea.l D0, A0
- *  415db2  movea.l (A0), A1
- *  415db4  move.w  ($4,A1), D0
- *  415db8  andi.w  #$20a0, D0
- *  415dbc  cmpi.w  #$2020, D0
- *  415dc0  bne     $415dde
- *  415dc2  ...                      (driver wants time)
+ *  415dac  move.l  (A3)+, D0           415dc2  moveq   #$0, D0
+ *  415dae  beq     $415dde             415dc4  move.w  ($22,A1), D0
+ *  415db0  movea.l D0, A0              415dc8  beq     $415dda
+ *  415db2  movea.l (A0), A1            415dca  add.l   ($1a,A1), D0
+ *  415db4  move.w  ($4,A1), D0         415dce  cmp.l   $16a.w, D0
+ *  415db8  andi.w  #$20a0, D0          415dd2  bgt     $415dde
+ *  415dbc  cmpi.w  #$2020, D0          415dd4  move.l  $16a.w, ($1a,A1)
+ *  415dc0  bne     $415dde             415dda  bsr     $415c78  (accRun)
  *  415dde  subq.w  #1, D3
  *  415de0  bgt     $415dac
- *  415de2  ...
+ *  415de2  _SetPort
  */
-static uint32_t unit_scan(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+static uint32_t scan_units(jregs_t *j, uint32_t *ninstr)
 {
-        uint32_t a3 = A(3), d3 = D(3) & 0xffff, n = 0;
+        uint32_t a3 = A(3), d3 = D(3) & 0xffff, n = *ninstr, next = 0x415de2;
         for (;;) {
                 uint32_t d0 = rd32(a3);
                 a3 += 4;
@@ -1692,15 +1692,25 @@ static uint32_t unit_scan(jregs_t *j, uint32_t pc, uint32_t *ninstr)
                         set_w(&D(0), fl);
                         n += 6;                 /* movea x2, move.w, andi, cmpi, bne */
                         if (fl == 0x2020) {
-                                /* cmpi's flags: equal */
-                                j->n = 0;
-                                j->not_z = 0;
-                                j->v = 0;
-                                j->c = 0;
-                                A(3) = a3;
-                                set_w(&D(3), d3);
-                                *ninstr = n;
-                                return (pc & 0xff000000) | 0x415dc2;
+                                uint32_t delay = rd16(a1 + 0x22);
+                                D(0) = delay;
+                                flags_logic(j, delay, 2);
+                                n += 3;         /* moveq, move.w, beq */
+                                if (!delay) {
+                                        next = 0x415dda;
+                                        break;
+                                }
+                                uint32_t cur = rd32(a1 + 0x1a), ticks = rd32(0x16a);
+                                flags_add(j, delay, cur, 4);
+                                D(0) = delay + cur;
+                                uint32_t x = j->x;
+                                flags_cmp(j, D(0), ticks, 4);
+                                j->x = x;
+                                n += 3;         /* add, cmp, bgt */
+                                if ((int32_t)D(0) <= (int32_t)ticks) {
+                                        next = 0x415dd4;
+                                        break;
+                                }
                         }
                 }
                 /* subq.w #1, D3 (sets X too); bgt */
@@ -1718,7 +1728,91 @@ static uint32_t unit_scan(jregs_t *j, uint32_t pc, uint32_t *ninstr)
         A(3) = a3;
         set_w(&D(3), d3);
         *ninstr = n;
-        return (pc & 0xff000000) | 0x415de2;
+        return next;
+}
+
+static uint32_t unit_scan(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        *ninstr = 0;
+        return scan_units(j, ninstr);
+}
+
+/* SystemTask's ROM body (behind the Notification Manager patch), between
+ * its traps: up to GetPort; after FrontWindow, the desk accessory check
+ * and on through the unit table scan; after SetPort, the return.
+ *
+ *  415d72  movem.l D3/A3, -(A7)        415d8a  move.l  (A7)+, D0
+ *  415d76  bset    #$7, $a62.w         415d8c  beq     $415da4
+ *  415d7c  bne     $415de8             415d8e  movea.l D0, A0
+ *  415d80  subq.w  #4, A7              415d90  bsr     $415c40
+ *  415d82  move.l  A7, -(A7)           415d94  bne     $415da4
+ *  415d84  _GetPort                    415da4  movea.l $11c.w, A3
+ *  415d86  clr.l   -(A7)               415da8  move.w  $1d2.w, D3
+ *  415d88  _FrontWindow                415dac  ...     (the scan)
+ *
+ *  415c40  move.w  ($6c,A0), D0        415de4  clr.b   $a62.w
+ *  415c44  bpl     $415c58             415de8  movem.l (A7)+, D3/A3
+ *  415c58  moveq   #-$1, D0            415dec  rts
+ *  415c5a  rts
+ */
+static uint32_t system_task(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        pc &= 0xffffff;
+        if (pc == 0x415d72) {
+                push32(j, A(3));
+                push32(j, D(3));
+                uint32_t b = rd8(0xa62);
+                wr8(0xa62, b | 0x80);
+                j->not_z = b & 0x80;                    /* bset: Z only */
+                if (b & 0x80) {
+                        *ninstr = 3;
+                        return 0x415de8;
+                }
+                A(7) -= 4;
+                uint32_t sp = A(7);
+                push32(j, sp);
+                flags_logic(j, sp, 4);
+                *ninstr = 5;
+                return 0x415d84;
+        }
+        if (pc == 0x415de4) {
+                wr8(0xa62, 0);
+                flags_logic(j, 0, 1);
+                D(3) = rd32(A(7));
+                A(3) = rd32(A(7) + 4);
+                A(7) += 8;
+                *ninstr = 3;
+                return rts(j);
+        }
+        /* 415d8a */
+        uint32_t fw = rd32(A(7)), n = 2;
+        A(7) += 4;
+        D(0) = fw;
+        flags_logic(j, fw, 4);
+        if (fw) {
+                A(0) = fw;
+                uint32_t kind = rd16(fw + 0x6c);
+                set_w(&D(0), kind);
+                flags_logic(j, kind, 2);
+                push32(j, 0x415d94);
+                n += 4;                                 /* movea, bsr, move, bpl */
+                if (kind & 0x8000) {
+                        *ninstr = n;
+                        return 0x415c46;
+                }
+                A(7) += 4;
+                D(0) = 0xffffffffu;
+                flags_moveq(j, -1);
+                n += 3;                                 /* moveq, rts, bne */
+        }
+        A(3) = rd32(0x11c);
+        uint32_t d3 = rd16(0x1d2);
+        set_w(&D(3), d3);
+        flags_logic(j, d3, 2);
+        n += 2;
+        *ninstr = n;
+        return scan_units(j, ninstr);
 }
 
 /* QuickDraw UnionRect(src1, src2, dst): Pascal, args on the stack.  The
@@ -2446,6 +2540,9 @@ const m68k_native_t m68k_natives[] = {
         { 0x413f10, find_ref_id, "find resource ID" },
         { 0x413f1e, find_type, "find resource type" },
         { 0x415dac, unit_scan, "SystemTask driver scan" },
+        { 0x415d72, system_task, "SystemTask (to GetPort)" },
+        { 0x415d8a, system_task, "SystemTask (scan)" },
+        { 0x415de4, system_task, "SystemTask (exit)" },
         { 0x40a184, union_rect, "UnionRect" },
         { 0x40a41e, bitblt_rows, "bitblt rows" },
 };
