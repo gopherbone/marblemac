@@ -3,10 +3,11 @@
  * Draws a QuickDraw cursor into a Playdate-style 1bpp framebuffer,
  * optionally rotated around its hotspot.  Rotated cursors are
  * supersampled (3x3) so the thin white outline of the arrow survives
- * at awkward angles.
+ * at awkward angles, and cached per angle step.
  */
 
 #include <math.h>
+#include <string.h>
 #include "cursor.h"
 
 /* The arrow's body lies between straight down and down-right (its left
@@ -98,14 +99,25 @@ static void     draw_upright(uint8_t *frame, int stride, int width, int height,
         }
 }
 
-void    cursor_draw(uint8_t *frame, int stride, int width, int height,
-                    const mac_cursor_t *c, int x, int y, float rotation)
-{
-        if (fabsf(rotation) < 0.02f) {
-                draw_upright(frame, stride, width, height, c, x, y);
-                return;
-        }
+/* Rotated images are rendered once per angle step and cached (until the
+ * Mac changes cursor): each is a 47x47 opaque mask plus colour.  128
+ * steps of 2.8 degrees; step 0 is drawn upright, straight from the Mac's
+ * bitmap.
+ */
+#define ROT_STEPS       128
+#define ROT_SIZE        (2 * ROT_RADIUS + 1)
 
+typedef struct {
+        uint64_t opaque[ROT_SIZE];      /* bit dx + ROT_RADIUS */
+        uint64_t black[ROT_SIZE];
+} rot_img_t;
+
+static rot_img_t rot_cache[ROT_STEPS];
+static uint8_t rot_valid[ROT_STEPS];
+static mac_cursor_t rot_key;
+
+static void     render_rotated(rot_img_t *img, const mac_cursor_t *c, float rotation)
+{
         float cs = cosf(rotation);
         float sn = sinf(rotation);
         /* Hotspot point is the centre of the hotspot pixel */
@@ -113,14 +125,8 @@ void    cursor_draw(uint8_t *frame, int stride, int width, int height,
         float hy = c->hot_v + 0.5f;
 
         for (int dy = -ROT_RADIUS; dy <= ROT_RADIUS; dy++) {
-                int sy = y + dy;
-                if (sy < 0 || sy >= height)
-                        continue;
+                uint64_t op = 0, bl = 0;
                 for (int dx = -ROT_RADIUS; dx <= ROT_RADIUS; dx++) {
-                        int sx = x + dx;
-                        if (sx < 0 || sx >= width)
-                                continue;
-
                         int m = 0, d = 0;
                         for (int j = 0; j < SS; j++) {
                                 float py = dy + (j - (SS - 1) / 2.0f) / SS;
@@ -143,11 +149,52 @@ void    cursor_draw(uint8_t *frame, int stride, int width, int height,
                          * outline stays visible.
                          */
                         if (m * 2 >= SS * SS - 1) {
+                                uint64_t b = (uint64_t)1 << (dx + ROT_RADIUS);
+                                op |= b;
                                 if (d * 2 > m + 1)
-                                        px_black(frame, stride, sx, sy);
-                                else
-                                        px_white(frame, stride, sx, sy);
+                                        bl |= b;
                         }
+                }
+                img->opaque[dy + ROT_RADIUS] = op;
+                img->black[dy + ROT_RADIUS] = bl;
+        }
+}
+
+void    cursor_draw(uint8_t *frame, int stride, int width, int height,
+                    const mac_cursor_t *c, int x, int y, float rotation)
+{
+        float turns = rotation * (1 / (2 * (float)M_PI));
+        int step = (int)lrintf((turns - floorf(turns)) * ROT_STEPS) & (ROT_STEPS - 1);
+        if (step == 0) {
+                draw_upright(frame, stride, width, height, c, x, y);
+                return;
+        }
+
+        if (memcmp(c, &rot_key, sizeof rot_key)) {
+                rot_key = *c;
+                memset(rot_valid, 0, sizeof rot_valid);
+        }
+        rot_img_t *img = &rot_cache[step];
+        if (!rot_valid[step]) {
+                render_rotated(img, c, step * (2 * (float)M_PI / ROT_STEPS));
+                rot_valid[step] = 1;
+        }
+
+        for (int r = 0; r < ROT_SIZE; r++) {
+                int sy = y + r - ROT_RADIUS;
+                uint64_t op = img->opaque[r];
+                if (!op || sy < 0 || sy >= height)
+                        continue;
+                while (op) {
+                        int b = __builtin_ctzll(op);
+                        op &= op - 1;
+                        int sx = x + b - ROT_RADIUS;
+                        if (sx < 0 || sx >= width)
+                                continue;
+                        if (img->black[r] >> b & 1)
+                                px_black(frame, stride, sx, sy);
+                        else
+                                px_white(frame, stride, sx, sy);
                 }
         }
 }
