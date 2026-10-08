@@ -103,6 +103,11 @@ static uint16_t *entry_tramp;           /* uint32_t tramp(block | 1) */
 #define MAX_EXITS       32768
 #define MAX_LINKS       32768
 typedef struct { uint32_t slot, stub; } exit_rec_t;    /* byte offsets in code_buf */
+/* stub's top bits: the exit left its flags unstored, so it may only be
+ * linked to a block whose first instruction overwrites them (KF_*)
+ */
+#define EXIT_NEED_SHIFT 30
+#define EXIT_STUB_MASK  ((1u << EXIT_NEED_SHIFT) - 1)
 typedef struct { uint16_t exit_hi; uint16_t exit_lo; int32_t next; } link_t;
 static exit_rec_t *exits;
 static uint32_t nexits;
@@ -137,6 +142,7 @@ int m68k_jit_no_jcache;                 /* testing: never fill it */
 int m68k_jit_max_budget;                /* testing: cap instructions per run (0 = none) */
 int m68k_jit_no_traces;                 /* testing: end blocks at conditional branches */
 int m68k_jit_no_follow;                 /* testing: don't fold unconditional jumps into traces */
+int m68k_jit_exit_flag_elide = 1;       /* chained exits skip storing flags the target overwrites */
 /* Testing: perturb code layout (to tell real wins from cache-placement
  * luck).  skew: bytes left empty before the first block (multiple of 2;
  * build-time default JIT_CODE_SKEW); pad: bytes left empty after each block.
@@ -210,7 +216,7 @@ static void unlink_page(uint32_t p)
                 uint32_t e = (uint32_t)links[l].exit_hi << 16 | links[l].exit_lo;
                 uint16_t *slot = (uint16_t *)((char *)code_buf + exits[e].slot);
                 tbr_t b = { slot, C_AL };
-                t_patch_branch(b, (uint16_t *)((char *)code_buf + exits[e].stub));
+                t_patch_branch(b, (uint16_t *)((char *)code_buf + (exits[e].stub & EXIT_STUB_MASK)));
                 plat->code_written(slot, 4);
         }
         page_links[p] = -1;
@@ -773,7 +779,8 @@ typedef struct {
         uint32_t pc;            /* ST_EXIT/ST_SMC: where the 68k goes next */
         uint8_t type, size, ra, rv;
         uint8_t ninstr;         /* ST_SMC */
-        int8_t fpend, fxpend, fr9kind;  /* ST_SMC: flag state at the store */
+        int8_t fpend, fxpend, fr9kind;  /* ST_SMC: flag state at the store; ST_EXIT: unstored flags */
+        uint8_t need;           /* ST_EXIT: flags left unstored (KF_* the target must kill) */
 } stub_t;
 
 enum { F_NONE = -1, F_ADD, F_SUB, F_LOGIC, F_SHIFT };
@@ -878,6 +885,7 @@ static void emit_load(tctx_t *t, int size, int ra)
 
 static void emit_store_ck(tctx_t *t, int size, int ra, int rv, int check);
 static void emit_smc_check(tctx_t *t);
+static void emit_flush_flags(tctx_t *t);
 static void emit_exit_const(tctx_t *t, uint32_t pc, int ninstr);
 static int can_follow(tctx_t *t, uint32_t target);
 
@@ -957,9 +965,22 @@ static void emit_stub(tctx_t *t, stub_t *st)
                 uint32_t idx = nexits < MAX_EXITS ? nexits++ : MAX_EXITS;
                 if (idx < MAX_EXITS) {
                         exits[idx].slot = (uint32_t)((char *)st->from2.at - (char *)code_buf);
-                        exits[idx].stub = (uint32_t)((char *)E->p - (char *)code_buf);
+                        exits[idx].stub = (uint32_t)((char *)E->p - (char *)code_buf) |
+                                          (uint32_t)st->need << EXIT_NEED_SHIFT;
                 }
                 t_patch_branch(st->from2, E->p);
+                if (st->need) {
+                        /* The inline exit skipped storing the flags (the
+                         * next block overwrites them); leaving for the
+                         * dispatcher, they have to be right.
+                         */
+                        fstate_t now = t->f;
+                        t->f.pend = st->fpend;
+                        t->f.xpend = st->fxpend;
+                        t->f.r9kind = st->fr9kind;
+                        emit_flush_flags(t);
+                        t->f = now;
+                }
                 t_mov32(E, R0, st->pc);
                 t_str(E, R0, R4, OFF_PC);
                 t_mov32(E, R0, idx < MAX_EXITS ? idx + 1 : 0);
@@ -1351,6 +1372,64 @@ static void emit_charge(tctx_t *t, int ninstr)
         t16(E, 0x3F00 | ninstr);                /* subs r7, #ninstr */
 }
 
+/* Does the 68k instruction op (as this translator handles it, when it's
+ * the first of a block) overwrite the flags before anything can read
+ * them or leave the block?  KF_NZVC: N, Z, V and C; KF_X: X as well.
+ */
+#define KF_NZVC 1
+#define KF_X    2
+static int kills_flags(uint32_t op)
+{
+        int sz = op >> 6 & 3, mode = op >> 3 & 7, reg = op & 7, opmode = op >> 6 & 7;
+        switch (op >> 12) {
+        case 0x1: case 0x2: case 0x3:                   /* MOVE (not MOVEA) */
+                return opmode == 1 ? 0 : KF_NZVC;
+        case 0x7:                                       /* MOVEQ */
+                return op & 0x100 ? 0 : KF_NZVC;
+        case 0x4:
+                if (sz != 3 && ((op & 0xff00) == 0x4a00 || (op & 0xff00) == 0x4200 ||
+                                (op & 0xff00) == 0x4600))       /* TST, CLR, NOT */
+                        return KF_NZVC;
+                if (sz != 3 && (op & 0xff00) == 0x4400)         /* NEG */
+                        return KF_NZVC | KF_X;
+                if ((op & 0xfff8) == 0x4840 || (op & 0xfff8) == 0x4880 || (op & 0xfff8) == 0x48c0)
+                        return KF_NZVC;                         /* SWAP, EXT */
+                return 0;
+        case 0x0:                                       /* ORI ANDI SUBI ADDI EORI CMPI */
+                if ((op & 0x100) || (op & 0xf00) == 0x800 || sz == 3 || (mode == 7 && reg == 4))
+                        return 0;
+                switch (op >> 9 & 7) {
+                case 0: case 1: case 5: case 6: return KF_NZVC;
+                case 2: case 3: return KF_NZVC | KF_X;
+                }
+                return 0;
+        case 0x5:                                       /* ADDQ/SUBQ, not to An */
+                return sz == 3 || mode == 1 ? 0 : KF_NZVC | KF_X;
+        case 0x8:                                       /* OR (not DIV, SBCD) */
+                return opmode < 3 || ((opmode & 3) != 3 && mode >= 2) ? KF_NZVC : 0;
+        case 0xc:                                       /* AND, MUL (not ABCD, EXG) */
+                return opmode < 4 || opmode == 7 || mode >= 2 ? KF_NZVC : 0;
+        case 0x9: case 0xd:                             /* ADD/SUB (not ADDA, ADDX) */
+                return opmode < 3 || ((opmode & 3) != 3 && mode >= 2) ? KF_NZVC | KF_X : 0;
+        case 0xb:                                       /* CMP, CMPA, CMPM, EOR */
+                return KF_NZVC;
+        case 0xe:                                       /* LSd/ASd #n,Dn */
+                return sz != 3 && !(op & 0x20) && (op >> 3 & 3) <= 1 ? KF_NZVC | KF_X : 0;
+        }
+        return 0;
+}
+
+/* kills_flags for the block at pc.  Not for a native ROM routine's
+ * block: natives read the flags from the register file (SR), so they
+ * have to be stored.
+ */
+static int target_kills_flags(uint32_t pc)
+{
+        if (!m68k_jit_no_native && m68k_native_lookup(pc) >= 0)
+                return 0;
+        return kills_flags(peek16(pc));
+}
+
 /* Leave the block for 68k address pc after `ninstr` instructions.  Exits
  * to ROM get a chain slot: a branch that starts out going to the exit stub
  * and gets patched to jump straight into the next block.
@@ -1358,12 +1437,30 @@ static void emit_charge(tctx_t *t, int ninstr)
 static void emit_exit_const(tctx_t *t, uint32_t pc, int ninstr)
 {
         fstate_t saved = t->f;
-        emit_flush_flags(t);
+        int chain = chainable(pc) && t->nstubs < MAX_STUBS && nexits < MAX_EXITS;
+        int need = 0;
+        if (chain && m68k_jit_exit_flag_elide && (t->f.pend != F_NONE || t->f.xpend)) {
+                /* Chained into a block that overwrites the flags first
+                 * thing: don't store them on the way.  (The exit stub
+                 * does, for the trip back to the dispatcher; linking
+                 * checks the target block still starts that way.)
+                 */
+                int k = target_kills_flags(pc);
+                if ((k & KF_NZVC) && (!t->f.xpend || (k & KF_X)))
+                        need = KF_NZVC | (t->f.xpend ? KF_X : 0);
+        }
+        fstate_t unstored = t->f;
+        if (!need)
+                emit_flush_flags(t);
         emit_charge(t, ninstr);
-        if (chainable(pc) && t->nstubs < MAX_STUBS && nexits < MAX_EXITS) {
+        if (chain) {
                 stub_t *st = &t->stubs[t->nstubs++];
                 st->type = ST_EXIT;
                 st->pc = pc;
+                st->need = need;
+                st->fpend = unstored.pend;
+                st->fxpend = unstored.xpend;
+                st->fr9kind = unstored.r9kind;
                 /* Only backward exits (loops) check the budget: anything that
                  * runs forever has to come back round through one of those,
                  * or through a computed jump, which checks too.
@@ -2769,6 +2866,12 @@ static void link_exit(uint32_t e, uint32_t recycles)
 {
         jit_entry_t *next = get_block(J->pc);
         if (!next->code || m68k_jit_stats.recycles != recycles || e >= nexits)
+                return;
+        /* An exit that leaves its flags unstored needs a target that
+         * overwrites them (RAM code may have changed since it was built)
+         */
+        uint32_t need = exits[e].stub >> EXIT_NEED_SHIFT;
+        if (need && (target_kills_flags(J->pc) & need) != need)
                 return;
         /* RAM targets: remember the link so retiring the page undoes it */
         for (int i = 0; i < MAX_PAGES; i++) {
