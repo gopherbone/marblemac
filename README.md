@@ -53,6 +53,10 @@ Marble Mac stands on other people's work:
 See `external/umac/README.md` and `external/umac/external/Musashi/readme.txt`
 for their licences.
 
+## Licence
+
+GPLv2 (see `LICENSE`). The vendored code keeps its own licences.
+
 ## AI disclosure
 
 Almost all of the code outside `external/` (the Playdate frontend, the
