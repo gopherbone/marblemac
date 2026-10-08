@@ -666,6 +666,8 @@ static uint32_t plat_run(void *entry, void *code, jregs_t *regs)
         /* Instructions executed: what came off the budget (incl. chained blocks) */
         j1 = *regs;
         uint32_t n = j0.budget - j1.budget;
+        if (m68k_jit_idle_request)
+                n -= M68K_JIT_IDLE_DRAIN;       /* (the run stopped at an idle GetNextEvent) */
 
         if (io_touched || io_unverifiable || njit_w >= 65536) {
                 unverified++;
@@ -951,12 +953,12 @@ static void report(const char *when)
         m68kjit_stats_t *s = &m68k_jit_stats;
         double tot = (double)(s->jit_instrs + s->interp_instrs);
         fprintf(stderr, "[%s] t=%.1fs  jit %llu (%.1f%%)  interp %llu  blocks %llu  avg %.1f/blk  "
-                "translations %u (conflict %u stale %u recycles %u, %.0f B/blk, chains %u)  natives %u (%llu instrs)  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
+                "translations %u (conflict %u stale %u recycles %u, %.0f B/blk, chains %u)  natives %u (%llu instrs)  idle %u  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
                 when, t_us / 1e6, (unsigned long long)s->jit_instrs, tot ? 100.0 * s->jit_instrs / tot : 0,
                 (unsigned long long)s->interp_instrs, (unsigned long long)s->blocks,
                 s->blocks ? (double)s->jit_instrs / s->blocks : 0,
                 s->translations, s->conflicts, s->stale, s->recycles,
-                s->translations ? (double)s->code_bytes / s->translations : 0, s->chains, s->native_calls, (unsigned long long)s->native_instrs, s->flushes, (unsigned long long)verified,
+                s->translations ? (double)s->code_bytes / s->translations : 0, s->chains, s->native_calls, (unsigned long long)s->native_instrs, s->idle_quanta, s->flushes, (unsigned long long)verified,
                 (unsigned long long)unverified, (unsigned long long)mismatches);
 }
 
@@ -1059,6 +1061,8 @@ int main(int argc, char **argv)
         m68k_jit_no_follow = getenv("NOFOLLOW") != NULL;
         extern int m68k_jit_fused_ea;
         m68k_jit_fused_ea = getenv("FUSED") != NULL;
+        extern int m68k_jit_idle_yield;
+        m68k_jit_idle_yield = getenv("IDLE") != NULL;   /* (changes instruction counts) */
         extern int m68k_jit_no_native;
         m68k_jit_no_native = getenv("NONATIVE") != NULL;
         extern int m68k_jit_no_traces;
@@ -1163,6 +1167,15 @@ int main(int argc, char **argv)
                         } else {
                                 size_report();
                         }
+                } else if (!strcmp(argv[i], "dumpexec")) {
+                        /* per-pc execution counts (uint32, pc 0..0x41ffff), then reset */
+                        FILE *o = fopen(argv[++i], "wb");
+                        if (iexec && o) {
+                                fwrite(iexec, 4, 0x420000, o);
+                                memset(iexec, 0, 4 * 0x1000000);
+                        }
+                        if (o)
+                                fclose(o);
                 } else if (!strcmp(argv[i], "traps")) {
                         if (!trapprof_on) {
                                 trapprof_on = 1;

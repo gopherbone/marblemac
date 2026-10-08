@@ -71,6 +71,7 @@ typedef struct {
         uint32_t follows;       /* unconditional jumps folded into traces */
         uint32_t native_calls;  /* native ROM routines run */
         uint64_t native_instrs; /* ... and the 68k instructions they stood in for */
+        uint32_t idle_quanta;   /* execute calls slept through (idle yield) */
         uint64_t code_bytes;    /* generated */
         uint32_t chains;        /* exits linked straight to the next block */
         float t_run, t_xlat, t_interp, t_total;   /* seconds, if platform has now() */
@@ -101,6 +102,10 @@ extern void (*m68k_jit_interp_observer)(uint32_t pc, uint32_t opcode);
 void    m68k_jit_sync_out(void);
 void    m68k_jit_sync_in(void);
 jregs_t *m68k_jit_regs(void);
+/* Idle yield: set while a run is ending early because the Mac is idling;
+ * that run's budget then includes M68K_JIT_IDLE_DRAIN that wasn't used */
+extern int m68k_jit_idle_request;
+#define M68K_JIT_IDLE_DRAIN     (1 << 24)
 /* Executes exactly one instruction with Musashi (no interrupt check) */
 void    m68k_step_one(void);
 

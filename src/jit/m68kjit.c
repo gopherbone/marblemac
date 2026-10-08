@@ -286,10 +286,38 @@ static uint32_t mv_read(uint32_t a, int lng);
 static void mv_write(uint32_t a, uint32_t v, int lng);
 int m68k_jit_no_native;         /* testing: run the ROM code instead */
 
+/* Idle yield: an app calling GetNextEvent again within the same tick,
+ * with nothing in the event queue, is just spinning until something
+ * happens.  Stop the CPU there (at the trap's routine, as if it were a
+ * slow CPU) until the next interrupt, like STOP.  The block drains its
+ * budget (IDLE_DRAIN, taken back off afterwards) to get out promptly.
+ */
+int m68k_jit_idle_yield = 1;
+#define IDLE_DRAIN      M68K_JIT_IDLE_DRAIN
+int m68k_jit_idle_request;
+static int sleeping;
+static uint32_t gne_prev_ticks;
+
+static void check_idle(uint32_t trap)
+{
+        if (trap != 0xa970 || !m68k_jit_idle_yield || m68ki_cpu.int_mask)
+                return;                         /* GetNextEvent, interrupts on */
+        uint32_t ticks = mv_read(0x16a, 1), qhead = mv_read(0x14c, 1);
+        if (qhead == 0 && ticks == gne_prev_ticks) {
+                m68k_jit_idle_request = 1;
+                gne_prev_ticks = ticks + 1;     /* the pass after waking counts for that tick */
+        } else {
+                gne_prev_ticks = ticks;
+        }
+}
+
 static uint32_t h_aline(uint32_t pc, uint32_t b)
 {
         (void)b;
         J->native_n = 0;
+        check_idle(peek16(pc));
+        if (m68k_jit_idle_request)
+                J->native_n = IDLE_DRAIN;
         if (m68ki_cpu.s_flag != SFLAG_SET || m68ki_cpu.t1_flag || m68ki_cpu.t0_flag) {
                 m68k_jit_sync_out();
                 REG_PPC = pc;
@@ -311,7 +339,7 @@ static uint32_t h_aline(uint32_t pc, uint32_t b)
         if ((vec == 0x401f52 || vec == 0x401f4a) && !m68k_jit_no_native) {
                 uint32_t n;
                 uint32_t to = aline_dispatch(a7, vec == 0x401f4a, &n);
-                J->native_n = n;
+                J->native_n += n;
                 m68k_jit_stats.native_calls++;
                 m68k_jit_stats.native_instrs += n;
                 return to;
@@ -2749,6 +2777,17 @@ int m68k_jit_execute(int num_cycles)
         J = plat->regs ? plat->regs() : &local;
         m68k_jit_sync_in();
         m68ki_remaining_cycles = num_cycles;
+        if (sleeping) {
+                /* Idle: sleep on until an interrupt is taken */
+                uint32_t pc0 = J->pc;
+                check_interrupts();
+                if (J->pc == pc0 || CPU_STOPPED) {
+                        m68k_jit_sync_out();
+                        m68k_jit_stats.idle_quanta++;
+                        return num_cycles;
+                }
+                sleeping = 0;
+        }
         check_interrupts();
 
         while (m68ki_remaining_cycles > 0) {
@@ -2776,6 +2815,12 @@ int m68k_jit_execute(int num_cycles)
                         if (plat->now)
                                 m68k_jit_stats.t_run += plat->now() - t0;
                         int32_t n = budget - J->budget;
+                        if (m68k_jit_idle_request) {
+                                m68k_jit_idle_request = 0;
+                                n -= IDLE_DRAIN;
+                                sleeping = 1;
+                                m68ki_remaining_cycles = 0;
+                        }
                         m68ki_remaining_cycles -= 8 * n;
                         m68k_jit_stats.blocks++;
                         m68k_jit_stats.jit_instrs += n;
