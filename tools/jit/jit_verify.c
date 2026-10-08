@@ -1218,6 +1218,9 @@ int main(int argc, char **argv)
         m68k_jit_no_jcache = getenv("NOJC") != NULL;
         extern int m68k_jit_no_follow;
         m68k_jit_no_follow = getenv("NOFOLLOW") != NULL;
+        extern int m68k_jit_defer_mrs;
+        if (getenv("NODEFER"))
+                m68k_jit_defer_mrs = 0;
         extern int m68k_jit_exit_flag_elide;
         if (getenv("NOELIDE"))
                 m68k_jit_exit_flag_elide = 0;

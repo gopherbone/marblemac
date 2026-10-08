@@ -143,6 +143,7 @@ int m68k_jit_max_budget;                /* testing: cap instructions per run (0 
 int m68k_jit_no_traces;                 /* testing: end blocks at conditional branches */
 int m68k_jit_no_follow;                 /* testing: don't fold unconditional jumps into traces */
 int m68k_jit_exit_flag_elide = 1;       /* chained exits skip storing flags the target overwrites */
+int m68k_jit_defer_mrs = 1;             /* capture flags (MRS) only once something needs them */
 /* Testing: perturb code layout (to tell real wins from cache-placement
  * luck).  skew: bytes left empty before the first block (multiple of 2;
  * build-time default JIT_CODE_SKEW); pad: bytes left empty after each block.
@@ -948,6 +949,7 @@ static void emit_stub(tctx_t *t, stub_t *st)
         if (st->from.at)
                 t_patch_branch(st->from, E->p);
         t->f.apsr = 0;
+        E->defer = 0;   /* (every path into a stub has captured the flags) */
         switch (st->type) {
         case ST_SMC:
         case ST_BRANCH: {
@@ -998,6 +1000,7 @@ static void emit_stub(tctx_t *t, stub_t *st)
 /* Store X from r9 (as computed by an op of `kind`) */
 static void emit_store_x(tctx_t *t, int kind)
 {
+        t_realize(E);
         t_movsh(E, 0, R3, R9, SH_LSR, 21);
         t_andi(E, R3, R3, 0x100);
         if (kind == F_SUB)
@@ -1032,7 +1035,10 @@ static void retire_r9(tctx_t *t, int new_sets_x)
 static void emit_flags(tctx_t *t, int kind, int set_x)
 {
         retire_r9(t, set_x);
-        t_mrs_apsr(E, R9);
+        if (m68k_jit_defer_mrs)
+                E->defer = R9 + 1;      /* emitted when something needs r9 or changes APSR */
+        else
+                t_mrs_apsr(E, R9);
         t->f.apsr = E->fclob + 1;
         t->f.pend = kind;
         t->f.xpend = set_x;
@@ -1043,6 +1049,7 @@ static void emit_flags(tctx_t *t, int kind, int set_x)
 static void emit_flags_const(tctx_t *t, int n, int z, int v, int c)
 {
         retire_r9(t, 0);
+        E->defer = 0;                   /* r9 gets overwritten / the flags are dead */
         if (v || c) {
                 /* Not expressible as LOGIC; store directly */
                 t_mov32(E, R2, n ? 0x80 : 0);
@@ -2018,6 +2025,7 @@ static int tr_shift(tctx_t *t, uint32_t op)
                 t_movsh(E, 0, R1, R0, SH_LSL, sh);              /* operand at the top */
                 t_movsh(E, 1, R0, R1, SH_LSL, count);           /* N, Z, C */
                 retire_r9(t, 1);
+                E->defer = 0;
                 t_mrs_apsr(E, R9);
                 t_movsh(E, 0, R2, R1, SH_ASR, 31 - count);      /* top count+1 bits, sign-extended */
                 t_addi(E, R2, R2, 1);                           /* 0 or 1 if they were all equal */
@@ -2098,9 +2106,16 @@ static int tr_scc(tctx_t *t, uint32_t op)
 static void emit_cond_exit(tctx_t *t, int c, uint32_t pc, int n)
 {
         int apsr_ok = t->f.apsr == E->fclob + 1;
+        /* An owed MRS can wait: the exit path emits it if it needs it,
+         * and the branch leaves APSR alone for the other path.
+         */
+        int defer = E->defer;
+        E->defer = 0;
         tbr_t skip = t_b_placeholder(E, invert_cond(c));
+        E->defer = defer;
         emit_exit_const(t, pc, n);
         t_patch_branch(skip, E->p);
+        E->defer = defer;
         /* Only the branch arrives here, flags untouched */
         t->f.apsr = apsr_ok ? E->fclob + 1 : 0;
 }
@@ -2490,6 +2505,7 @@ static uint16_t *translate(uint32_t pc, jit_entry_t *ent)
         t->e.start = t->e.p = code_ptr;
         t->e.end = code_end;
         t->e.full = 0;
+        t->e.defer = 0;
         t->start_pc = pc;
         t->count = 0;
         t->nstubs = 0;
@@ -2509,7 +2525,7 @@ static uint16_t *translate(uint32_t pc, jit_entry_t *ent)
                         break;
                 uint16_t *mark = t->e.p;
                 fstate_t fmark = t->f;
-                int smark = t->nstubs;
+                int smark = t->nstubs, dmark = t->e.defer;
                 int ni = m68k_jit_no_native ? -1 : m68k_native_lookup(at);
                 if (ni >= 0) {
                         /* A native routine: alone in its block */
@@ -2527,6 +2543,19 @@ static uint16_t *translate(uint32_t pc, jit_entry_t *ent)
                 uint32_t op = peek16(at);
                 uint16_t *istart = t->e.p;
                 t->alu_imm_valid = 0;
+                if (t->e.defer) {
+                        /* Flags still only in APSR, and this instruction
+                         * overwrites them before anything can look: they
+                         * never need capturing.
+                         */
+                        int k = kills_flags(op);
+                        if ((k & KF_NZVC) && (!t->f.xpend || (k & KF_X))) {
+                                t->e.defer = 0;
+                                t->f.pend = F_NONE;
+                                t->f.xpend = 0;
+                                t->f.r9kind = F_NONE;
+                        }
+                }
 #ifdef JIT_DEBUG_PC
                 t_mov32(E, R12, at);    /* crash dumps show r12: the 68k pc */
 #endif
@@ -2536,6 +2565,7 @@ static uint16_t *translate(uint32_t pc, jit_entry_t *ent)
                         t->e.full = 0;
                         t->f = fmark;
                         t->nstubs = smark;
+                        t->e.defer = dmark;
                         break;
                 }
                 at = t->fetch;

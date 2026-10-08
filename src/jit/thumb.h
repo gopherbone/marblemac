@@ -12,6 +12,9 @@ typedef struct {
         uint16_t *p, *start, *end;
         int full;
         uint32_t fclob;         /* instructions emitted that may change APSR flags */
+        int defer;              /* nonzero: "mrs r(defer - 1), APSR" is owed; it's
+                                 * emitted before the next instruction that may
+                                 * change the flags, and before any branch */
 } temit_t;
 
 enum { R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, SP, LR, PC };
@@ -29,6 +32,7 @@ static inline int t_flagsafe16(uint16_t h)
 {
         return (h >= 0x5000 && h < 0xA000) ||           /* ldr/str forms */
                (h & 0xFF00) == 0x4600 ||                /* mov (high regs) */
+               (h & 0xFF00) == 0x4400 ||                /* add (high regs, T2: no S) */
                (h & 0xF500) == 0xB100 ||                /* cbz/cbnz */
                (h & 0xFF00) == 0xB200 ||                /* sxth/uxth/sxtb/uxtb */
                (h & 0xFF00) == 0xBA00 ||                /* rev/rev16/revsh */
@@ -58,17 +62,35 @@ static inline int t_flagsafe32(uint16_t h1, uint16_t h2)
         return (h1 & 0xFF00) == 0xFB00;                 /* multiplies */
 }
 
+/* Emit an owed MRS now (it reads the flags, so doesn't count as a clobber) */
+static inline void t_realize(temit_t *e)
+{
+        if (!e->defer)
+                return;
+        if (e->p + 2 > e->end) { e->full = 1; return; }
+        e->p[0] = 0xF3EF;
+        e->p[1] = 0x8000 | (e->defer - 1) << 8;
+        e->p += 2;
+        e->defer = 0;
+}
+
 static inline void t16(temit_t *e, uint16_t h)
 {
+        if (!t_flagsafe16(h)) {
+                t_realize(e);
+                e->fclob++;
+        }
         if (e->p >= e->end) { e->full = 1; return; }
-        e->fclob += !t_flagsafe16(h);
         *e->p++ = h;
 }
 
 static inline void t32(temit_t *e, uint16_t h1, uint16_t h2)
 {
+        if (!t_flagsafe32(h1, h2)) {
+                t_realize(e);
+                e->fclob++;
+        }
         if (e->p + 2 > e->end) { e->full = 1; return; }
-        e->fclob += !t_flagsafe32(h1, h2);
         e->p[0] = h1;
         e->p[1] = h2;
         e->p += 2;
@@ -303,6 +325,7 @@ typedef struct {
 
 static inline tbr_t t_b_placeholder(temit_t *e, int cond)
 {
+        t_realize(e);           /* (both paths get the flags) */
         tbr_t b = { e->p, cond };
         if (e->p + 2 > e->end) { e->full = 1; return b; }
         e->p[0] = e->p[1] = 0;  /* (branches don't touch the flags) */
@@ -332,6 +355,7 @@ static inline void t_patch_branch(tbr_t b, uint16_t *target)
 /* BL to a known target (T1; same immediate layout as B.W T4) */
 static inline void t_bl_to(temit_t *e, uint16_t *target)
 {
+        t_realize(e);           /* (first, so `at` is the BL) */
         uint16_t *at = e->p;
         t32(e, 0, 0);
         if (e->full)
