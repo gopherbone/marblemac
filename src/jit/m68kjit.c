@@ -786,6 +786,7 @@ typedef struct {
         uint8_t ninstr;         /* ST_SMC */
         int8_t fpend, fxpend, fr9kind;  /* ST_SMC: flag state at the store; ST_EXIT: unstored flags */
         uint8_t need;           /* ST_EXIT: flags left unstored (KF_* the target must kill) */
+        uint8_t fdefer;         /* ST_EXIT: MRS still owed (temit_t.defer) */
 } stub_t;
 
 enum { F_NONE = -1, F_ADD, F_SUB, F_LOGIC, F_SHIFT };
@@ -984,6 +985,7 @@ static void emit_stub(tctx_t *t, stub_t *st)
                          * next block overwrites them); leaving for the
                          * dispatcher, they have to be right.
                          */
+                        E->defer = st->fdefer;
                         fstate_t now = t->f;
                         t->f.pend = st->fpend;
                         t->f.xpend = st->fxpend;
@@ -1507,12 +1509,24 @@ static void emit_exit_const(tctx_t *t, uint32_t pc, int ninstr)
                 emit_flush_flags(t);
         else if (!(need & KF_X) && t->f.xpend)
                 emit_store_x(t, t->f.pend);
-        emit_charge(t, ninstr);
+        int fdefer = 0;
+        if (chain && need && E->defer && pc > t->pc) {
+                /* Flags still only in APSR, and the chained path never
+                 * needs them: charge without touching APSR (sub, not
+                 * subs) and let the stub capture them.
+                 */
+                fdefer = E->defer;
+                E->defer = 0;
+                t_subi(E, R7, R7, ninstr);
+        } else {
+                emit_charge(t, ninstr);
+        }
         if (chain) {
                 stub_t *st = &t->stubs[t->nstubs++];
                 st->type = ST_EXIT;
                 st->pc = pc;
                 st->need = need;
+                st->fdefer = fdefer;
                 st->fpend = unstored.pend;
                 st->fxpend = unstored.xpend;
                 st->fr9kind = unstored.r9kind;
