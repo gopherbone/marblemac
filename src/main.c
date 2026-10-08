@@ -600,6 +600,11 @@ static void draw_stats(unsigned int now)
                                                  (double)stat_speed, (double)stat_fps, mac_ready);
 #if defined(UMAC_JIT) && defined(MARBLE_PROFILE)
                         m68kjit_stats_t *js = &m68k_jit_stats;
+                        pd->system->logToConsole("marblemac: natives %lu calls %lu instrs (%.0fms), aline %.0fms, idle quanta %lu",
+                                                 (unsigned long)js->native_calls, (unsigned long)js->native_instrs,
+                                                 (double)js->t_native * 1000, (double)js->t_aline * 1000,
+                                                 (unsigned long)js->idle_quanta);
+                        js->t_native = js->t_aline = 0;
                         pd->system->logToConsole("marblemac: %.1fs: emu %.0fms (run %.0f xlat %.0f interp %.0f) jit %lu interp %lu blocks %lu xlat %lu",
                                                  (double)(now - prof_ms0) / 1000, (double)js->t_total * 1000,
                                                  (double)js->t_run * 1000, (double)js->t_xlat * 1000,

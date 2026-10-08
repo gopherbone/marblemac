@@ -317,9 +317,20 @@ static void check_idle(uint32_t trap)
         }
 }
 
+static uint32_t h_aline_body(uint32_t pc);
+
 static uint32_t h_aline(uint32_t pc, uint32_t b)
 {
         (void)b;
+        float t0 = plat->now ? plat->now() : 0;
+        uint32_t r = h_aline_body(pc);
+        if (plat->now)
+                m68k_jit_stats.t_aline += plat->now() - t0;
+        return r;
+}
+
+static uint32_t h_aline_body(uint32_t pc)
+{
         J->native_n = 0;
         check_idle(peek16(pc));
         if (m68k_jit_idle_request)
@@ -641,7 +652,10 @@ void m68k_jit_write(uint32_t addr, uint32_t v, int size)
 static uint32_t h_native(uint32_t idx, uint32_t pc)
 {
         uint32_t n = 0;
+        float t0 = plat->now ? plat->now() : 0;
         uint32_t next = m68k_natives[idx].fn(J, pc, &n);
+        if (plat->now)
+                m68k_jit_stats.t_native += plat->now() - t0;
         J->native_n = n;
         m68k_native_stats[idx].calls++;
         m68k_native_stats[idx].instrs += n;

@@ -75,6 +75,7 @@ typedef struct {
         uint64_t code_bytes;    /* generated */
         uint32_t chains;        /* exits linked straight to the next block */
         float t_run, t_xlat, t_interp, t_total;   /* seconds, if platform has now() */
+        float t_native, t_aline;                  /* ... inside natives, inside h_aline */
 } m68kjit_stats_t;
 
 extern m68kjit_stats_t m68k_jit_stats;
