@@ -1,0 +1,84 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PLAYDATE_SDK_VERSION: 3.1.2
+  # Same major as the local build (15.3.rel1 isn't published for Linux x86_64)
+  ARM_TOOLCHAIN_VERSION: 15.2.rel1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Playdate SDK and Arm toolchain
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/PlaydateSDK
+            ~/arm-gnu-toolchain
+          key: tools-pd${{ env.PLAYDATE_SDK_VERSION }}-arm${{ env.ARM_TOOLCHAIN_VERSION }}
+
+      - name: Download Playdate SDK and Arm toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/PlaydateSDK ~/arm-gnu-toolchain
+          curl -fsSL "https://download.panic.com/playdate_sdk/Linux/PlaydateSDK-${PLAYDATE_SDK_VERSION}.tar.gz" \
+            | tar -xz -C ~/PlaydateSDK --strip-components=1
+          curl -fsSL "https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_TOOLCHAIN_VERSION}/binrel/arm-gnu-toolchain-${ARM_TOOLCHAIN_VERSION}-x86_64-arm-none-eabi.tar.xz" \
+            | tar -xJ -C ~/arm-gnu-toolchain --strip-components=1
+
+      - name: Build (device)
+        env:
+          MARBLE_SIM: '0'
+        run: |
+          export PLAYDATE_SDK_PATH="$HOME/PlaydateSDK"
+          export ARM_TOOLCHAIN_BIN="$HOME/arm-gnu-toolchain/bin"
+          "$ARM_TOOLCHAIN_BIN/arm-none-eabi-gcc" --version | head -1
+          ./build.sh
+
+      - name: Check the bundle has no ROM or disk image
+        run: |
+          test -f marblemac.pdx/pdex.bin
+          if find marblemac.pdx -iname 'rom*' -o -iname '*.img' -o -iname 'disk*' | grep .; then
+            echo "ROM/disk image found in the bundle" >&2; exit 1
+          fi
+
+      - name: Zip
+        run: |
+          mkdir dist
+          zip -r dist/marblemac.pdx.zip marblemac.pdx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marblemac.pdx
+          path: dist/marblemac.pdx.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: marblemac.pdx
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" marblemac.pdx.zip \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

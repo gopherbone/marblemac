@@ -6,11 +6,23 @@ For the [Playdate](https://play.date). Load it up and find out.
 ![](docs/games.png)
 ![](docs/tetris.png)
 
+## Releases
+
+Download `marblemac.pdx.zip` from the
+[Releases](https://github.com/gopherbone/marblemac/releases) page, unzip
+it, and sideload `marblemac.pdx` onto your Playdate (via
+[play.date/account/sideload](https://play.date/account/sideload) or the
+Data Disk). Apple's ROM and system software aren't included: copy your
+own `rom.bin` and `disk.img` (see below) into `Data/local.nick.marblemac/`
+on the Playdate's Data Disk (Settings > System > Reboot to Data Disk).
+
 ## Building
 
 You'll need the Playdate SDK, CMake, and Arm's GNU toolchain
 (`build.sh` looks in `/Applications/ArmGNUToolchain`, since Homebrew's
-`arm-none-eabi-gcc` ships without a C library).
+`arm-none-eabi-gcc` ships without a C library; set `ARM_TOOLCHAIN_BIN`
+and `PLAYDATE_SDK_PATH` to use others, and `MARBLE_SIM=0` to build for
+the device only).
 
 Apple's ROM and system software aren't included. Put these in `Source/`
 before building:

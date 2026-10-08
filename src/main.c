@@ -562,7 +562,12 @@ static void draw_stats(unsigned int now)
 static void draw_fatal(void)
 {
         pd->graphics->clear(kColorWhite);
-        pd->graphics->drawText(fatal_msg, strlen(fatal_msg), kASCIIEncoding, 10, 10);
+        const char *s = fatal_msg;
+        for (int y = 10; *s; y += 20) {         /* one line per '\n' */
+                size_t n = strcspn(s, "\n");
+                pd->graphics->drawText(s, n, kASCIIEncoding, 10, y);
+                s += n + (s[n] == '\n');
+        }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -655,7 +660,11 @@ static void init(void)
         int dummy;
         mac_rom = load_file(ROM_FILE, &rom_size, &dummy);
         if (!mac_rom) {
-                fatal_msg = "Need rom.bin (Mac Plus v3 ROM) in Data or Source";
+                fatal_msg = "No rom.bin found.\n\n"
+                        "Put your own Mac Plus v3 ROM\n"
+                        "(rom.bin) and boot disk (disk.img) in\n"
+                        "Data/local.nick.marblemac/\n"
+                        "on the Playdate's data disk.";
                 return;
         }
         if (rom_size < ROM_SIZE) {
