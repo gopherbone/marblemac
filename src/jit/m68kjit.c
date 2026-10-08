@@ -115,6 +115,7 @@ static link_t *links;
 static int32_t nlinks;
 static int32_t *page_links;             /* per page: first link, -1 = none */
 static uint16_t *mat_fn[4][2];          /* materialise flags [kind][with X] */
+static uint16_t *matx_fn[4];            /* ... just X [kind] */
 static uint16_t *rd_fn[5], *wr_fn[5];   /* shared memory access, by size (1, 2, 4) */
 static uint16_t *dyn_jump;              /* exit to a computed pc via the jump cache */
 static uint16_t *exit_common;           /* chainable exit stubs: r0 = exit index + 1 */
@@ -1013,6 +1014,10 @@ static void emit_stub(tctx_t *t, stub_t *st)
 static void emit_store_x(tctx_t *t, int kind)
 {
         t_realize(E);
+        if (kind != F_LOGIC && kind != F_NONE) {
+                t_bl_to(E, matx_fn[kind]);      /* (4 bytes instead of 10-14) */
+                return;
+        }
         t_movsh(E, 0, R3, R9, SH_LSR, 21);
         t_andi(E, R3, R3, 0x100);
         if (kind == F_SUB)
@@ -1494,10 +1499,14 @@ static void emit_exit_const(tctx_t *t, uint32_t pc, int ninstr)
                 int k = target_kills_flags(pc);
                 if ((k & KF_NZVC) && (!t->f.xpend || (k & KF_X)))
                         need = KF_NZVC | (t->f.xpend ? KF_X : 0);
+                else if ((k & KF_NZVC) && t->f.pend != F_NONE)
+                        need = KF_NZVC;         /* X still has to be stored */
         }
         fstate_t unstored = t->f;
         if (!need)
                 emit_flush_flags(t);
+        else if (!(need & KF_X) && t->f.xpend)
+                emit_store_x(t, t->f.pend);
         emit_charge(t, ninstr);
         if (chain) {
                 stub_t *st = &t->stubs[t->nstubs++];
@@ -2742,6 +2751,18 @@ static void emit_permanent(void)
                         }
                         t_bx(e, LR);
                 }
+        }
+        /* X only, from r9 as left by an op of `kind`: r3 */
+        for (int kind = F_ADD; kind <= F_SHIFT; kind++) {
+                if (kind == F_LOGIC)
+                        continue;
+                matx_fn[kind] = e->p;
+                t_movsh(e, 0, R3, R9, SH_LSR, 21);
+                t_andi(e, R3, R3, 0x100);
+                if (kind == F_SUB)
+                        t_eori(e, R3, R3, 0x100);
+                t_str(e, R3, R4, OFF_X);
+                t_bx(e, LR);
         }
         /* Memory access.  rdN: r0 = addr -> r0 = value.  wrN: r0 = addr,
          * r1 = value.  RAM fast path first; ROM next (reads); else C.
