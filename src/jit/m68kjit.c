@@ -2948,10 +2948,41 @@ static void interp_one(void)
                 m68k_jit_stats.t_interp += plat->now() - t0;
 }
 
+/* Re-layout.  Translations land in the code buffer in the order they're
+ * first needed, so once the machine settles into a loop (the Finder
+ * idling, an application waiting for input), the code it runs is
+ * scattered among everything translated before.  Starting over then
+ * retranslates just that working set, in the order it runs: chained
+ * blocks end up next to each other and nothing dead shares their cache
+ * lines.  So: after a quiet stretch (hardly any new translations) that
+ * follows a lot of new code, throw the translations away once.
+ */
+#define RELAYOUT_WINDOW 1000000         /* 68k instructions per check (~1s) */
+#define RELAYOUT_QUIET  4               /* at most this many translations in it */
+#define RELAYOUT_BYTES  (256 * 1024)    /* code generated since the last start-over */
+int m68k_jit_relayout = 1;             /* 0: off; n: after n * RELAYOUT_BYTES of new code */
+
+static void maybe_relayout(void)
+{
+        static uint64_t win_instrs;
+        static uint32_t win_xlat;
+        uint64_t done = m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs;
+        if (done - win_instrs < RELAYOUT_WINDOW)
+                return;
+        int quiet = m68k_jit_stats.translations - win_xlat <= RELAYOUT_QUIET;
+        win_instrs = done;
+        win_xlat = m68k_jit_stats.translations;
+        if (m68k_jit_relayout && quiet && (uint32_t)((char *)code_ptr - (char *)perm_end) >= (uint32_t)m68k_jit_relayout * RELAYOUT_BYTES) {
+                recycle_code();
+                m68k_jit_stats.relayouts++;
+        }
+}
+
 int m68k_jit_execute(int num_cycles)
 {
         if (!plat)
                 return m68k_execute(num_cycles);        /* JIT unavailable */
+        maybe_relayout();
         float t_start = plat->now ? plat->now() : 0;
         jregs_t local;
         J = plat->regs ? plat->regs() : &local;
@@ -3028,6 +3059,13 @@ int m68k_jit_execute(int num_cycles)
         if (plat->now)
                 m68k_jit_stats.t_total += plat->now() - t_start;
         return num_cycles - m68ki_remaining_cycles;
+}
+
+/* Throw away all translations (between m68k_jit_execute calls) */
+void m68k_jit_flush_code(void)
+{
+        if (plat)
+                recycle_code();
 }
 
 /* Debugging: translate the block at pc and return its code */

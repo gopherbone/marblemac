@@ -65,6 +65,7 @@ typedef struct {
         uint32_t translations;
         uint32_t flushes;       /* code-write invalidations */
         uint32_t recycles;      /* code buffer wrapped */
+        uint32_t relayouts;     /* ... of which: started over to re-lay out a working set */
         uint32_t conflicts;     /* lookup evicted another block */
         uint32_t stale;         /* block's page was invalidated */
         uint32_t smc_exits;     /* store sites that can leave a block early */
@@ -85,6 +86,7 @@ int     m68k_jit_init(const m68kjit_platform_t *plat, uint8_t *ram, uint32_t ram
                       const uint8_t *rom, uint32_t rom_size, uint32_t code_size);
 /* Drop-in for m68k_execute() */
 int     m68k_jit_execute(int num_cycles);
+void    m68k_jit_flush_code(void);
 /* Call on every RAM write made outside translated code */
 void    m68k_jit_note_write(uint32_t addr, uint32_t size);
 /* Testing: called (before the write) for every RAM write noted */
