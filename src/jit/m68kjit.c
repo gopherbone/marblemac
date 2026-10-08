@@ -284,7 +284,10 @@ static uint32_t h_codewrite(uint32_t a, uint32_t b) { return check_write(a, b); 
 static uint32_t aline_dispatch(uint32_t sp, int alt, uint32_t *ninstr);
 static uint32_t mv_read(uint32_t a, int lng);
 static void mv_write(uint32_t a, uint32_t v, int lng);
-int m68k_jit_no_native;         /* testing: run the ROM code instead */
+#ifndef JIT_NATIVES
+#define JIT_NATIVES     1
+#endif
+int m68k_jit_no_native = !JIT_NATIVES;  /* testing: run the ROM code instead */
 
 /* Idle yield: an app calling GetNextEvent again within the same tick,
  * with nothing in the event queue, is just spinning until something
@@ -292,7 +295,10 @@ int m68k_jit_no_native;         /* testing: run the ROM code instead */
  * slow CPU) until the next interrupt, like STOP.  The block drains its
  * budget (IDLE_DRAIN, taken back off afterwards) to get out promptly.
  */
-int m68k_jit_idle_yield = 1;
+#ifndef JIT_IDLE_YIELD
+#define JIT_IDLE_YIELD  1
+#endif
+int m68k_jit_idle_yield = JIT_IDLE_YIELD;
 #define IDLE_DRAIN      M68K_JIT_IDLE_DRAIN
 int m68k_jit_idle_request;
 static int sleeping;

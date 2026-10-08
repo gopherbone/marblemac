@@ -441,16 +441,42 @@ static void emu_run(unsigned int wall_dt_ms)
 }
 
 #ifdef MARBLE_TIMING
-/* Repeatable device benchmark: boot the same fresh disk with no input,
- * emulating flat out, and log the device time each 5 emulated seconds
- * took.  (Build with -DMARBLE_TIMING.)
+/* Repeatable device benchmark: boot the same fresh disk, emulating flat
+ * out with scripted input (below), and log the device time each 5
+ * emulated seconds took.  (Build with -DMARBLE_TIMING.)
+ *
+ * A fixed bit of work once the Finder is up (the same as jit_verify's
+ * test script): open the disk, the Games folder, then Tetris.  {emulated
+ * ms, x, y}: double-click there.
  */
+static const struct { unsigned ms; int x, y; } timing_script[] = {
+        { 22000, 470, 45 }, { 25000, 175, 110 }, { 35000, 182, 188 },
+};
+
+static void timing_input(void)
+{
+        unsigned ms = (unsigned)(emu_us / 1000);
+        int x = MAC_W / 2, y = MAC_H / 2, button = 0;
+        for (unsigned i = 0; i < sizeof timing_script / sizeof *timing_script; i++) {
+                if (ms < timing_script[i].ms)
+                        break;
+                x = timing_script[i].x;
+                y = timing_script[i].y;
+                unsigned t = ms - timing_script[i].ms;  /* down 75, up 75, down 75 */
+                button = t < 75 || (t >= 150 && t < 225);
+        }
+        if (mac_ready)
+                mac_set_mouse(x, y);
+        umac_mouse(0, 0, button);
+}
+
 static void timing_run(void)
 {
         static float spent;
         static uint64_t next_mark = 5000000;
         unsigned int start = pd->system->getCurrentTimeMilliseconds();
         while (pd->system->getCurrentTimeMilliseconds() - start < EMU_BUDGET_MS) {
+                timing_input();
                 float t0 = pd->system->getElapsedTime();
                 emu_quantum();
                 spent += pd->system->getElapsedTime() - t0;
