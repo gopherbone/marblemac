@@ -36,7 +36,9 @@
 #define T_RET   0x0e000000u
 #define T_REGS  0x22000000u
 
+#ifndef CODE_SIZE
 #define CODE_SIZE (2u << 20)
+#endif
 
 static uint32_t ring[64];
 static int ringi;
@@ -92,6 +94,7 @@ static int cache_access(cache_t *c, uint32_t addr, int allocate)
         return seq ? 1 : 2;
 }
 
+static uint64_t perm_line_fetch[128];  /* PERMHIST: fetches per line of the shared area */
 static uint64_t imiss_from_perm_linestart;
 static uint64_t imiss_perm, imiss_entry, imiss_mid, imiss_from_perm, imiss_back, imiss_fwd;
 static uint32_t sim_prev_addr;
@@ -101,6 +104,7 @@ static const char *ophist_name[] = { "mrs", "msr", "bl", "ldr/str [r4] (regfile)
         "mov/movw/movt", "b/bcc/cbz", "subs r7 (budget)", "push/pop", "dp/other 16", "dp/other 32" };
 static uint64_t ophist[11][2];
 static uint64_t ophist_reload, ophist_reload_any, ophist_w32, ophist_w32_odd, ophist_w32_cross;
+static struct { uint32_t key; uint64_t n; } *ophist_enc;        /* OPHIST_ENC=file */
 static void ophist_count(uc_engine *u, uint32_t a, uint32_t size)
 {
         uint16_t h[2] = { 0, 0 };
@@ -131,6 +135,15 @@ static void ophist_count(uc_engine *u, uint32_t a, uint32_t size)
                 ophist_w32_odd += (a & 2) != 0;
                 ophist_w32_cross += (a & 7) == 6;
         }
+        if (ophist_enc && a >= T_CODE + 0x4000) {
+                /* exact encodings of block code (not the shared area), open addressing */
+                uint32_t key = size == 4 ? (uint32_t)h1 << 16 | h2 : 0xFFFF0000u | h1;
+                uint32_t i = (key * 0x9e3779b1u) >> 18;
+                while (ophist_enc[i].n && ophist_enc[i].key != key)
+                        i = (i + 1) & 16383;
+                ophist_enc[i].key = key;
+                ophist_enc[i].n++;
+        }
         /* ldr r,[r4,#n] right after str r,[r4,#n] (16-bit forms only) */
         static uint16_t prev;
         if (size == 2 && (h1 & 0xF800) == 0x6800 && (prev & 0xF800) == 0x6000 && (h1 & 0x7FF) == (prev & 0x7FF))
@@ -141,6 +154,15 @@ static void ophist_count(uc_engine *u, uint32_t a, uint32_t size)
 }
 static void ophist_report(void)
 {
+        if (ophist_enc) {
+                FILE *o = fopen(getenv("OPHIST_ENC"), "a");
+                for (int i = 0; i < 16384; i++)
+                        if (ophist_enc[i].n)
+                                fprintf(o, "%08x %llu\n", ophist_enc[i].key, (unsigned long long)ophist_enc[i].n);
+                fprintf(o, "--\n");
+                fclose(o);
+                memset(ophist_enc, 0, 16384 * sizeof *ophist_enc);
+        }
         uint64_t n = 0, b = 0;
         for (int k = 0; k < 11; k++) n += ophist[k][0], b += ophist[k][1];
         for (int k = 0; k < 11; k++)
@@ -177,6 +199,8 @@ static void sim_fetch(uc_engine *u, uint64_t address, uint32_t size, void *ud)
                         imiss_mid++;            /* fell through into a cold line */
         }
         sim_prev_addr = a;
+        if (a >= T_CODE && a < T_CODE + 4096)
+                perm_line_fetch[(a - T_CODE) / 32]++;
         if (ophist_on && a >= T_CODE)
                 ophist_count(u, a, size);
 }
@@ -287,6 +311,14 @@ static void sim_report(const char *when)
                 (unsigned long long)imiss_perm, (unsigned long long)imiss_entry, (unsigned long long)imiss_mid);
         fprintf(stderr, "    jump-target misses: %llu from shared routines (%llu at a line start), %llu short back, %llu short forward, rest far\n",
                 (unsigned long long)imiss_from_perm, (unsigned long long)imiss_from_perm_linestart, (unsigned long long)imiss_back, (unsigned long long)imiss_fwd);
+        if (getenv("PERMHIST")) {
+                fprintf(stderr, "    shared-area fetches per line:");
+                for (int i = 0; i < 128; i++)
+                        if (perm_line_fetch[i])
+                                fprintf(stderr, " %d:%llu", i * 32, (unsigned long long)perm_line_fetch[i]);
+                fprintf(stderr, "\n");
+        }
+        memset(perm_line_fetch, 0, sizeof perm_line_fetch);
         imiss_perm = imiss_entry = imiss_mid = imiss_from_perm_linestart = imiss_from_perm = imiss_back = imiss_fwd = 0;
         if (ophist_on) {
                 ophist_report();
@@ -1107,11 +1139,11 @@ static void report(const char *when)
         m68kjit_stats_t *s = &m68k_jit_stats;
         double tot = (double)(s->jit_instrs + s->interp_instrs);
         fprintf(stderr, "[%s] t=%.1fs  jit %llu (%.1f%%)  interp %llu  blocks %llu  avg %.1f/blk  "
-                "translations %u (conflict %u stale %u recycles %u, %.0f B/blk, chains %u)  natives %u (%llu instrs)  idle %u  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
+                "translations %u (conflict %u stale %u recycles %u relayouts %u, %.0f B/blk, chains %u)  natives %u (%llu instrs)  idle %u  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
                 when, t_us / 1e6, (unsigned long long)s->jit_instrs, tot ? 100.0 * s->jit_instrs / tot : 0,
                 (unsigned long long)s->interp_instrs, (unsigned long long)s->blocks,
                 s->blocks ? (double)s->jit_instrs / s->blocks : 0,
-                s->translations, s->conflicts, s->stale, s->recycles,
+                s->translations, s->conflicts, s->stale, s->recycles, s->relayouts,
                 s->translations ? (double)s->code_bytes / s->translations : 0, s->chains, s->native_calls, (unsigned long long)s->native_instrs, s->idle_quanta, s->flushes, (unsigned long long)verified,
                 (unsigned long long)unverified, (unsigned long long)mismatches);
 }
@@ -1183,6 +1215,8 @@ int main(int argc, char **argv)
         uc_hook h4, h5, h6, h7, h8;
         if (getenv("SIM")) {
                 ophist_on = getenv("OPHIST") != NULL;
+                if (ophist_on && getenv("OPHIST_ENC"))
+                        ophist_enc = calloc(16384, sizeof *ophist_enc);
                 cache_init(&icache, 16384, 2);
                 cache_init(&dcache, 16384, 4);
                 uc_hook_add(uc, &h7, UC_HOOK_CODE, sim_fetch, NULL, 1, 0);
@@ -1218,6 +1252,9 @@ int main(int argc, char **argv)
         m68k_jit_no_jcache = getenv("NOJC") != NULL;
         extern int m68k_jit_no_follow;
         m68k_jit_no_follow = getenv("NOFOLLOW") != NULL;
+        extern int m68k_jit_relayout;
+        if (getenv("RELAYOUT"))
+                m68k_jit_relayout = atoi(getenv("RELAYOUT"));
         extern int m68k_jit_defer_mrs;
         if (getenv("NODEFER"))
                 m68k_jit_defer_mrs = 0;
@@ -1386,6 +1423,8 @@ int main(int argc, char **argv)
                         } else {
                                 trapprof_report(argv[++i]);
                         }
+                } else if (!strcmp(argv[i], "rc")) {
+                        m68k_jit_flush_code();
                 } else if (!strcmp(argv[i], "sim")) {
                         sim_report(argv[++i]);
                 } else if (!strcmp(argv[i], "ws")) {
