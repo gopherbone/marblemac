@@ -1012,6 +1012,474 @@ static uint32_t front_window(jregs_t *j, uint32_t pc, uint32_t *ninstr)
         return rts(j);
 }
 
+/* QuickDraw GlobalToLocal(pt) adds thePort's portBits.bounds top-left
+ * to the point; LocalToGlobal(pt) subtracts it.
+ *
+ *  408956  movem.l D0-D2/A0-A1, -(A7)  ; LocalToGlobal
+ *  40895a  moveq   #$1, D2
+ *  40895c  bra     $408964
+ *  40895e  movem.l D0-D2/A0-A1, -(A7)  ; GlobalToLocal
+ *  408962  clr.l   D2
+ *  408964  movea.l (A5), A0
+ *  408966  movea.l (A0), A0
+ *  408968  movea.l ($18,A7), A1
+ *  40896c  move.w  ($8,A0), D0
+ *  408970  move.w  ($a,A0), D1
+ *  408974  bsr     $40897c
+ *  408976  movem.l (A7)+, D0-D2/A0-A1
+ *  40897a  bra     $4089ac
+ *  40897c  tst.w   D2
+ *  40897e  beq     $408984
+ *  408980  neg.w   D0
+ *  408982  neg.w   D1
+ *  408984  add.w   D0, (A1)+
+ *  408986  add.w   D1, (A1)+
+ *  408988  rts
+ *  4089ac  move.l  (A7)+, (A7)
+ *  4089ae  rts
+ */
+static uint32_t local_global(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        int neg = (pc & 0xffffff) == 0x408956;
+        uint32_t s = A(7);
+        static const int save[5] = { 9, 8, 2, 1, 0 };   /* A1, A0, D2, D1, D0 */
+        for (int i = 0; i < 5; i++)
+                push32(j, j->dar[save[i]]);
+        uint32_t n = neg ? 3 : 2;
+        uint32_t port = rd32(rd32(A(5)));
+        uint32_t pt = rd32(A(7) + 0x18);
+        uint32_t d0 = rd16(port + 8), d1 = rd16(port + 0xa);
+        push32(j, 0x408976);                            /* bsr */
+        n += 8;                                         /* movea x3, move x2, bsr, tst, beq */
+        if (neg) {
+                d0 = -d0 & 0xffff;
+                d1 = -d1 & 0xffff;
+                n += 2;
+        }
+        uint32_t v = rd16(pt), h = rd16(pt + 2);
+        wr16(pt, v + d0);
+        wr16(pt + 2, h + d1);
+        flags_add(j, h, d1, 2);
+        uint32_t x = j->x;
+        A(7) += 4;                                      /* rts */
+        for (int i = 4; i >= 0; i--)                    /* movem.l (A7)+ */
+                j->dar[save[i]] = rd32(A(7) + 4 * (4 - i));
+        A(7) += 20;
+        uint32_t ret = rd32(s);
+        wr32(s + 4, ret);
+        flags_logic(j, ret, 4);
+        j->x = x;
+        A(7) = s + 8;
+        *ninstr = n + 3 + 2 + 2;                        /* adds, rts; movem, bra; move, rts */
+        return ret;
+}
+
+/* QuickDraw SetPort(port) / GetPort(&port): thePort is the first long of
+ * the QuickDraw globals at (A5).
+ *
+ *  4089b0  movea.l (A5), A0            4089b8  movea.l (A5), A0
+ *  4089b2  move.l  ($4,A7), (A0)       4089ba  movea.l ($4,A7), A1
+ *  4089b6  bra     $4089ac             4089be  move.l  (A0), (A1)
+ *                                      4089c0  bra     $4089ac
+ *  4089ac  move.l  (A7)+, (A7)
+ *  4089ae  rts
+ */
+static uint32_t set_get_port(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        uint32_t s = A(7), a0 = rd32(A(5)), arg = rd32(s + 4);
+        A(0) = a0;
+        if ((pc & 0xffffff) == 0x4089b0) {
+                wr32(a0, arg);
+                *ninstr = 5;
+        } else {
+                A(1) = arg;
+                wr32(arg, rd32(a0));
+                *ninstr = 6;
+        }
+        uint32_t ret = rd32(s);
+        wr32(s + 4, ret);
+        flags_logic(j, ret, 4);
+        A(7) = s + 8;
+        return ret;
+}
+
+/* QuickDraw EmptyRgn(rgn) = EmptyRect of its rgnBBox, and EmptyRect(r):
+ * Pascal, BOOLEAN result.
+ *
+ *  40bf90  movea.l (A7)+, A0           40a0aa  movea.l (A7)+, A1
+ *  40bf92  movea.l (A7)+, A1           40a0ac  movea.l (A7)+, A0
+ *  40bf94  movea.l (A1), A1            40a0ae  move.w  (A0)+, D0
+ *  40bf96  pea     ($2,A1)             40a0b0  move.w  (A0)+, D1
+ *  40bf9a  move.l  A0, -(A7)           40a0b2  cmp.w   (A0)+, D0
+ *  40bf9c  jmp     $40a0aa             40a0b4  bge     $40a0be
+ *                                      40a0b6  cmp.w   (A0)+, D1
+ *                                      40a0b8  bge     $40a0be
+ *                                      40a0ba  clr.b   (A7)
+ *                                      40a0bc  bra     $40a0c2
+ *                                      40a0be  move.b  #$1, (A7)
+ *                                      40a0c2  jmp     (A1)
+ */
+static uint32_t empty_rect(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        uint32_t n = 0;
+        if ((pc & 0xffffff) == 0x40bf90) {
+                uint32_t ret = rd32(A(7)), h = rd32(A(7) + 4);
+                uint32_t p = rd32(h);
+                A(7) += 8;
+                push32(j, p + 2);
+                push32(j, ret);
+                A(0) = ret;
+                A(1) = p;
+                n = 6;
+        }
+        uint32_t ret = rd32(A(7)), r = rd32(A(7) + 4);
+        A(7) += 8;
+        A(1) = ret;
+        uint32_t top = rd16(r), left = rd16(r + 2), bottom = rd16(r + 4);
+        set_w(&D(0), top);
+        set_w(&D(1), left);
+        flags_cmp(j, top, bottom, 2);
+        n += 6;
+        uint32_t a0 = r + 6;
+        int empty = (int16_t)top >= (int16_t)bottom;
+        if (!empty) {
+                uint32_t right = rd16(r + 6);
+                a0 += 2;
+                flags_cmp(j, left, right, 2);
+                n += 2;
+                empty = (int16_t)left >= (int16_t)right;
+        }
+        A(0) = a0;
+        wr8(A(7), empty);
+        flags_logic(j, empty, 1);
+        *ninstr = n + (empty ? 2 : 3);
+        return ret;
+}
+
+/* Memory Manager: skip non-free blocks from A3 up to A2 (heap zone A6).
+ * Leaves at 410990 when it gets to A2, at 410976 at a free block.
+ *
+ *  410962  cmpa.l  A2, A3
+ *  410964  bcc     $410990
+ *  410966  move.l  (A3), D0
+ *  410968  tst.b   (A3)
+ *  41096a  beq     $410976
+ *  41096c  and.l   $31a.w, D0
+ *  410970  adda.l  D0, A3
+ *  410972  moveq   #$0, D0
+ *  410974  bra     $410962
+ */
+static uint32_t heap_skip_used(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t n = 0, a3 = A(3), a2 = A(2), mask = rd32(0x31a), next;
+        for (;;) {
+                flags_cmp(j, a3, a2, 4);
+                n += 2;
+                if (a3 >= a2) {
+                        next = 0x410990;
+                        break;
+                }
+                D(0) = rd32(a3);
+                uint32_t tag = rd8(a3);
+                flags_logic(j, tag, 1);
+                n += 3;
+                if (!tag) {
+                        next = 0x410976;
+                        break;
+                }
+                a3 += D(0) & mask;
+                D(0) = 0;
+                flags_moveq(j, 0);
+                n += 4;
+                if (n >= LOOP_CAP) {
+                        next = 0x410962;
+                        break;
+                }
+        }
+        A(3) = a3;
+        *ninstr = n;
+        return next;
+}
+
+/* Memory Manager HLock / HUnlock / HPurge / HNoPurge (A0 = handle): set
+ * or clear a flag bit in the master pointer's high byte; MemErr ($220)
+ * = 0, or nilHandleErr for a purged handle.  (Behind the OS trap
+ * dispatcher's save/restore; a nil handle returns from the routine
+ * early with D0 = 0.)
+ *
+ *  410230  bsr     $410262             410262  move.l  A0, D0
+ *  410232  beq     $41025a             410264  and.l   $31a.w, D0
+ *  410234  bset    #$7, (A1)           410268  bne     $41026e
+ *  410238  bra     $410256             41026a  addq.l  #4, A7
+ *  (41023a bclr #7, 410244 bset #6,    41026c  rts
+ *   41024e bclr #6 -- no bra)          41026e  movea.l D0, A1
+ *  410256  moveq   #$0, D0             410270  move.l  (A1), D0
+ *  410258  bra     $41025c             410272  rts
+ *  41025a  moveq   #-$6d, D0
+ *  41025c  move.w  D0, $220.w
+ *  410260  rts
+ */
+static uint32_t handle_flag(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        pc &= 0xffffff;
+        uint32_t s = A(7);
+        wr32(s - 4, pc + 2);                            /* bsr */
+        uint32_t d0 = A(0) & rd32(0x31a);
+        D(0) = d0;
+        if (!d0) {
+                flags_logic(j, 0, 4);
+                A(7) = s + 4;
+                *ninstr = 6;
+                return rd32(s);
+        }
+        A(1) = d0;
+        d0 = rd32(d0);
+        uint32_t n = 8;                                 /* bsr .. rts, beq */
+        if (!d0)
+                d0 = (uint32_t)-0x6d;
+        else {
+                uint32_t b = rd8(A(1)), bit = pc < 0x410244 ? 0x80 : 0x40;
+                wr8(A(1), (pc - 0x410230) / 10 & 1 ? b & ~bit : b | bit);
+                n += pc == 0x41024e ? 1 : 2;            /* bset/bclr (, bra) */
+                d0 = 0;
+                n++;                                    /* moveq #0 */
+        }
+        D(0) = d0;
+        wr16(0x220, d0);
+        flags_logic(j, d0, 2);
+        A(7) = s + 4;
+        *ninstr = n + 3;                                /* (bra,) move, rts */
+        return rd32(s);
+}
+
+/* GetNextEvent's ROM body, in the stretches between its traps.  First,
+ * from the System patch's jump (the patch pushed D0-D2) up to the
+ * GetOSEvent/OSEventAvail trap:
+ *
+ *  411000  movem.l (A7)+, D0-D2        411064  clr.w   ($e,A6)
+ *  411004  subq.w  #2, A7              411068  movea.l ($8,A6), A3
+ *  411006  move.l  D0, -(A7)           41106c  move.w  ($c,A6), D0
+ *  411008  move.l  D1, -(A7)           411070  movea.l A3, A0
+ *  41100a  movem.l D1-D2, -(A7)        411072  bsr     $411142
+ *  41100e  moveq   #$0, D0             411076  beq     $41107e
+ *  411010  bsr     $411024             41107e  move.w  ($c,A6), D0
+ *  411024  link    A6, #$0             411082  movea.l A3, A0
+ *  411028  movem.l D3/A3, -(A7)        411084  tst.w   D3
+ *  41102c  move.l  D0, D3              411086  bpl     $41108c
+ *  41102e  bne     $411064             411088  _OSEventAvail
+ *  411030  bset    #$7, $15d.w         41108c  _GetOSEvent
+ *  411036  bne     $411064
+ *  411038  ...     (first call: the SystemEvent setup)
+ *
+ *  411142  btst    #$8, D0             (no network events wanted:)
+ *  411146  beq     $41119c             41119c  moveq   #$0, D1
+ *  411148  move.l  $a68.w, D1          41119e  rts
+ *  41114c  bgt     $4111a8
+ *  41114e  move.l  $a64.w, D1
+ *  411152  ble     $41119c
+ */
+static uint32_t gne_entry(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t s = A(7);
+        D(0) = rd32(s);
+        D(1) = rd32(s + 4);
+        D(2) = rd32(s + 8);
+        A(7) = s + 10;
+        push32(j, D(0));
+        push32(j, D(1));
+        push32(j, D(2));                                /* movem D1-D2 */
+        push32(j, D(1));
+        D(0) = 0;
+        push32(j, 0x411012);                            /* bsr */
+        push32(j, A(6));                                /* link */
+        A(6) = A(7);
+        push32(j, A(3));                                /* movem D3/A3 */
+        push32(j, D(3));
+        D(3) = 0;
+        uint32_t b = rd8(0x15d);
+        wr8(0x15d, b | 0x80);
+        j->n = 0;                                       /* move.l D0, D3; bset: Z */
+        j->v = j->c = 0;
+        j->not_z = b & 0x80;
+        uint32_t n = 13;
+        if (!(b & 0x80)) {
+                *ninstr = n;
+                return 0x411038;
+        }
+        wr16(A(6) + 0xe, 0);
+        A(3) = rd32(A(6) + 8);
+        uint32_t d0 = rd16(A(6) + 0xc);
+        set_w(&D(0), d0);
+        A(0) = A(3);
+        push32(j, 0x411076);                            /* bsr */
+        n += 7;                                         /* clr .. bsr, btst, beq */
+        if (d0 & 0x100) {
+                uint32_t v = rd32(0xa68);
+                D(1) = v;
+                flags_logic(j, v, 4);
+                n += 2;
+                if ((int32_t)v > 0) {
+                        *ninstr = n;
+                        return 0x4111a8;
+                }
+                v = rd32(0xa64);
+                D(1) = v;
+                flags_logic(j, v, 4);
+                n += 2;
+                if ((int32_t)v > 0) {
+                        *ninstr = n;
+                        return 0x411154;
+                }
+        }
+        D(1) = 0;
+        A(7) += 4;
+        d0 = rd16(A(6) + 0xc);
+        set_w(&D(0), d0);
+        A(0) = A(3);
+        flags_logic(j, 0, 2);                           /* tst.w D3 */
+        *ninstr = n + 2 + 5;                            /* moveq, rts; beq, move, movea, tst, bpl */
+        return 0x41108c;
+}
+
+/* GetNextEvent, the tail: after CheckUpdate, and after GetMouse; then
+ * back in the trap's glue, which returns through the filter at $29A.
+ *
+ *  4110b0  move.w  (A7)+, ($e,A6)      411136  movem.l (A7)+, D3/A3
+ *  4110b4  tst.w   D3                  41113a  unlk    A6
+ *  4110b6  bmi     $41112c             41113c  movea.l (A7)+, A0
+ *  4110b8  tst.w   ($e,A6)             41113e  addq.w  #6, A7
+ *  4110bc  beq     $41112c             411140  jmp     (A0)
+ *  4110be  ...     (an event: the      411012  move.w  (A7)+, D0
+ *                   SystemEvent stuff) 411014  movea.l (A7)+, A1
+ *  41112c  tst.w   (A3)                411016  move.w  D0, ($4,A7)
+ *  41112e  bne     $411136             41101a  move.l  $29a.w, -(A7)
+ *  411130  pea     $9fa.w              41101e  bne     $411022
+ *  411134  _GetMouse                   411020  addq.w  #4, A7
+ *                                      411022  rts
+ */
+static uint32_t gne_exit(jregs_t *j, uint32_t *n)
+{
+        A(3) = rd32(A(7) + 4);                          /* movem.l (A7)+, D3/A3 */
+        D(3) = rd32(A(7));
+        A(7) = A(6);                                    /* unlk */
+        A(6) = rd32(A(7));
+        uint32_t a0 = rd32(A(7) + 4);
+        A(0) = a0;
+        A(7) += 8 + 6;
+        *n += 5;
+        if ((a0 & 0xffffff) != 0x411012)
+                return a0;
+        uint32_t d0 = rd16(A(7));
+        set_w(&D(0), d0);
+        A(1) = rd32(A(7) + 2);
+        A(7) += 6;
+        wr16(A(7) + 4, d0);
+        uint32_t f = rd32(0x29a);
+        push32(j, f);
+        flags_logic(j, f, 4);
+        *n += 5;
+        if (!f) {
+                A(7) += 4;
+                (*n)++;
+        }
+        (*n)++;
+        return rts(j);
+}
+
+static uint32_t gne_after_update(jregs_t *j, uint32_t *n)
+{
+        /* at 4110b4 */
+        flags_logic(j, D(3), 2);
+        *n += 2;
+        if (!(D(3) & 0x8000)) {
+                uint32_t v = rd16(A(6) + 0xe);
+                flags_logic(j, v, 2);
+                *n += 2;
+                if (v)
+                        return 0x4110be;
+        }
+        uint32_t w = rd16(A(3));
+        flags_logic(j, w, 2);
+        *n += 2;
+        if (w)
+                return gne_exit(j, n);
+        push32(j, 0x9fa);
+        (*n)++;
+        return 0x411134;
+}
+
+/* After GetOSEvent: the journal check, then CheckUpdate if the event is
+ * null and update events are wanted.
+ *
+ *  41108e  movea.l A3, A1              410f68  move.w  $8de.w, D0
+ *  411090  moveq   #$4, D1             410f6c  beq     $410f9e
+ *  411092  bsr     $410f68             410f9e  rts
+ *  411096  tst.w   (A3)
+ *  411098  beq     $4110a0
+ *  41109a  addq.b  #1, ($e,A6)
+ *  41109e  bra     $4110b4
+ *  4110a0  move.w  ($c,A6), D0
+ *  4110a4  btst    #$6, D0
+ *  4110a8  beq     $4110b4
+ *  4110aa  clr.w   -(A7)
+ *  4110ac  move.l  A3, -(A7)
+ *  4110ae  _CheckUpdate
+ */
+static uint32_t gne_mid(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        uint32_t n = 0, next;
+        pc &= 0xffffff;
+        if (pc == 0x4110b0) {
+                uint32_t v = rd16(A(7));
+                A(7) += 2;
+                wr16(A(6) + 0xe, v);
+                n = 1;
+                next = gne_after_update(j, &n);
+        } else if (pc == 0x411136) {
+                next = gne_exit(j, &n);
+        } else {
+                A(1) = A(3);
+                D(1) = 4;
+                push32(j, 0x411096);
+                uint32_t jf = rd16(0x8de);
+                set_w(&D(0), jf);
+                flags_logic(j, jf, 2);
+                n = 5;
+                if (jf) {
+                        *ninstr = n;
+                        return 0x410f6e;
+                }
+                A(7) += 4;
+                uint32_t w = rd16(A(3));
+                flags_logic(j, w, 2);
+                n += 3;                                 /* rts, tst, beq */
+                if (w) {
+                        *ninstr = n;
+                        return 0x41109a;
+                }
+                uint32_t d0 = rd16(A(6) + 0xc);
+                set_w(&D(0), d0);
+                j->not_z = d0 & 0x40;                   /* btst (after move's N, V, C) */
+                j->n = (d0 >> 8) & 0x80;
+                j->v = j->c = 0;
+                n += 3;
+                if (!(d0 & 0x40))
+                        next = gne_after_update(j, &n);
+                else {
+                        A(7) -= 2;
+                        wr16(A(7), 0);
+                        push32(j, A(3));
+                        flags_logic(j, A(3), 4);
+                        n += 2;
+                        next = 0x4110ae;
+                }
+        }
+        *ninstr = n;
+        return next;
+}
+
 /* SystemTask: walk the unit table for drivers that are open, not busy
  * and want periodic time.  Skips entries that don't qualify; at one that
  * does, stops just after its test (415dc2), leaving the ROM to run it.
@@ -1776,6 +2244,21 @@ const m68k_native_t m68k_natives[] = {
         { 0x41405e, ref_find_handle, "ref scan (handle)" },
         { 0x4106c2, heap_find_free, "heap free-block search" },
         { 0x411d72, front_window, "FrontWindow" },
+        { 0x408956, local_global, "LocalToGlobal" },
+        { 0x40895e, local_global, "GlobalToLocal" },
+        { 0x4089b0, set_get_port, "SetPort" },
+        { 0x4089b8, set_get_port, "GetPort" },
+        { 0x40bf90, empty_rect, "EmptyRgn" },
+        { 0x40a0aa, empty_rect, "EmptyRect" },
+        { 0x410962, heap_skip_used, "heap skip used blocks" },
+        { 0x410230, handle_flag, "HLock" },
+        { 0x41023a, handle_flag, "HUnlock" },
+        { 0x410244, handle_flag, "HPurge" },
+        { 0x41024e, handle_flag, "HNoPurge" },
+        { 0x411000, gne_entry, "GetNextEvent (to GetOSEvent)" },
+        { 0x41108e, gne_mid, "GetNextEvent (to CheckUpdate)" },
+        { 0x4110b0, gne_mid, "GetNextEvent (to GetMouse)" },
+        { 0x411136, gne_mid, "GetNextEvent (exit)" },
         { 0x413f10, find_ref_id, "find resource ID" },
         { 0x413f1e, find_type, "find resource type" },
         { 0x415dac, unit_scan, "SystemTask driver scan" },
