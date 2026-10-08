@@ -1922,8 +1922,6 @@ typedef struct {
         uint32_t d0, d1, d2, d6, a2, a4, a5, sp, lo, n;
 } blt_t;
 
-static void wr16(uint32_t a, uint32_t v) { m68k_jit_write(a & 0xffffff, v & 0xffff, 2); }
-static void wr32(uint32_t a, uint32_t v) { m68k_jit_write(a & 0xffffff, v, 4); }
 
 #define SETW(r, v) ((r) = ((r) & 0xffff0000u) | ((v) & 0xffff))
 #define SX(v) ((uint32_t)(int32_t)(int16_t)(v))
