@@ -2021,11 +2021,25 @@ static int tr_bitop(tctx_t *t, uint32_t op)
         if (!ea_ok(mode, r, allowed))
                 return -1;
 
-        if (dynamic)
-                t_ldr(E, R8, R4, OFF_D(op >> 9 & 7));
-        else
-                t_mov32(E, R8, fetch16(t) & 0xff);
         int size = mode == EA_D ? 4 : 1;
+        if (!dynamic) {
+                /* Bit number known: extract / flip it with immediates */
+                int bit = fetch16(t) & (size == 4 ? 31 : 7);
+                emit_ea_read(t, mode, r, size, R10);
+                emit_flush_flags(t);
+                t->f.r9kind = F_NONE;
+                t_ubfx(E, R1, R0, bit, 1);
+                t_str(E, R1, R4, OFF_Z);
+                if (kind == 0)
+                        return 0;
+                t_dpi(E, kind == 1 ? DP_EOR : kind == 2 ? DP_BIC : DP_ORR, 0, R0, R0, 1u << bit);
+                if (mode == EA_D)
+                        t_str(E, R0, R4, OFF_D(r));
+                else
+                        emit_store(t, 1, R10, R0);
+                return 0;
+        }
+        t_ldr(E, R8, R4, OFF_D(op >> 9 & 7));
         t_andi(E, R8, R8, size == 4 ? 31 : 7);
         emit_ea_read(t, mode, r, size, R10);
         /* Only Z changes: make the others current first */
