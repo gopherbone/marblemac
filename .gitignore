@@ -1,0 +1,14 @@
+# Build output
+build/
+*.pdx/
+
+# Apple's ROM and system software: bring your own (see README)
+Source/rom.bin
+Source/disk.img
+Source/pdex.*
+disk.ovl
+
+# Upstream git metadata for the vendored trees
+.git.upstream
+
+.DS_Store
