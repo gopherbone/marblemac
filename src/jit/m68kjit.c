@@ -971,6 +971,21 @@ static int ea_ok(int mode, int reg, int allowed)
         return (ea_class(mode, reg) & allowed) != 0;
 }
 
+/* rd += v for an address: 16-bit forms where they fit.  Those set the
+ * ARM flags, which is fine while computing an operand's address: no
+ * instruction has flags in flight at that point (the encoder notes the
+ * clobber, so a later Bcc reloads APSR).
+ */
+static void ea_add(tctx_t *t, int rd, int32_t v)
+{
+        if (rd < 8 && v > 0 && v < 256)
+                t16(E, 0x3000 | rd << 8 | v);           /* adds rd, #v */
+        else if (rd < 8 && v < 0 && v > -256)
+                t16(E, 0x3800 | rd << 8 | -v);          /* subs rd, #-v */
+        else
+                add_const(t, rd, rd, v);
+}
+
 /* Index register for brief extension word, into rd (clobbers r2) */
 static void emit_index(tctx_t *t, int rd, uint32_t ext)
 {
@@ -978,8 +993,8 @@ static void emit_index(tctx_t *t, int rd, uint32_t ext)
         t_ldr(E, R2, R4, JR_OFF(dar) + 4 * xn);
         if (!(ext & 0x800))
                 t_sxth(E, R2, R2);
-        t_add(E, rd, rd, R2);
-        add_const(t, rd, rd, (int8_t)(ext & 0xff));
+        t16(E, 0x4400 | (rd & 8) << 4 | R2 << 3 | (rd & 7));  /* add rd, r2 */
+        ea_add(t, rd, (int8_t)(ext & 0xff));
 }
 
 /* Compute the address of a memory operand into rd (not r1-r3).
@@ -994,17 +1009,20 @@ static void emit_ea_addr(tctx_t *t, int mode, int reg, int size, int rd)
                 break;
         case EA_PI:
                 t_ldr(E, rd, R4, OFF_A(reg));
-                t_addi(E, R2, rd, step);
+                if (rd < 8)
+                        t16(E, 0x1C00 | step << 6 | rd << 3 | R2);      /* adds r2, rd, #step */
+                else
+                        t_addi(E, R2, rd, step);
                 t_str(E, R2, R4, OFF_A(reg));
                 break;
         case EA_PD:
                 t_ldr(E, rd, R4, OFF_A(reg));
-                t_subi(E, rd, rd, step);
+                ea_add(t, rd, -step);
                 t_str(E, rd, R4, OFF_A(reg));
                 break;
         case EA_DI:
                 t_ldr(E, rd, R4, OFF_A(reg));
-                add_const(t, rd, rd, (int16_t)fetch16(t));
+                ea_add(t, rd, (int16_t)fetch16(t));
                 break;
         case EA_IX: {
                 uint32_t ext = fetch16(t);
