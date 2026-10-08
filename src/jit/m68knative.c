@@ -191,10 +191,61 @@ static uint32_t unit_scan(jregs_t *j, uint32_t pc, uint32_t *ninstr)
         return (pc & 0xff000000) | 0x415de2;
 }
 
+/* QuickDraw UnionRect(src1, src2, dst): Pascal, args on the stack.  The
+ * Finder calls it twice per icon while working out window contents.
+ *
+ *  40a184  movea.l ($c,A7), A0         ; src1
+ *  40a188  movea.l ($8,A7), A1         ; src2
+ *  40a18c  move.w  (A0)+, D0           ; top = min, left = min,
+ *  40a18e  cmp.w   (A1)+, D0           ; bottom = max, right = max:
+ *  40a190  ble     $40a196             ; each move/cmp/bcc (+ move
+ *  40a192  move.w  (-$2,A1), D0        ; from src2 if it wins)
+ *  40a196  swap    D0
+ *  ...     (left, then bottom/right into D1 with bge)
+ *  40a1b8  movea.l ($4,A7), A0
+ *  40a1bc  move.l  D0, (A0)+
+ *  40a1be  move.l  D1, (A0)+
+ *  40a1c0  bra     $40a1f0
+ *  40a1f0  movea.l (A7)+, A0
+ *  40a1f2  adda.w  #$c, A7
+ *  40a1f6  jmp     (A0)
+ */
+static uint32_t union_rect(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t sp = A(7), s1 = rd32(sp + 12), s2 = rd32(sp + 8);
+        uint32_t n = 2 + 2 + 7;         /* moveas, swaps, the tail */
+        int16_t v[4];
+        for (int i = 0; i < 4; i++) {
+                int16_t a = (int16_t)rd16(s1 + 2 * i), b = (int16_t)rd16(s2 + 2 * i);
+                int take_b = i < 2 ? a > b : a < b;     /* ble / bge not taken */
+                v[i] = take_b ? b : a;
+                n += 3 + take_b;
+        }
+        uint32_t d0 = (uint32_t)(uint16_t)v[0] << 16 | (uint16_t)v[1];
+        uint32_t d1 = (uint32_t)(uint16_t)v[2] << 16 | (uint16_t)v[3];
+        uint32_t dst = rd32(sp + 4);
+        m68k_jit_write(dst & 0xffffff, d0, 4);
+        m68k_jit_write((dst + 4) & 0xffffff, d1, 4);
+        D(0) = d0;
+        D(1) = d1;
+        A(1) = s2 + 8;
+        /* flags: move.l D1, (A0)+ */
+        j->n = d1 >> 24;
+        j->not_z = d1;
+        j->v = j->c = 0;
+        uint32_t ret = rd32(sp);
+        A(0) = ret;
+        A(7) = sp + 16;
+        *ninstr = n;
+        return ret;
+}
+
 const m68k_native_t m68k_natives[] = {
         { 0x413f10, find_ref_id, "find resource ID" },
         { 0x413f1e, find_type, "find resource type" },
         { 0x415dac, unit_scan, "SystemTask driver scan" },
+        { 0x40a184, union_rect, "UnionRect" },
 };
 const int m68k_native_count = sizeof m68k_natives / sizeof m68k_natives[0];
 

@@ -18,7 +18,7 @@
 _start:
         .globl header
 header:
-        .word 0x6f00            // flags
+        .word 0x4f00            // flags (not dNeedTime: accRun does nothing)
         .word 0                 // ticks between actions
         .word 0                 // desk accessory event mask
         .word 0                 // menu ID

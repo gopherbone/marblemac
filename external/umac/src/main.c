@@ -275,8 +275,16 @@ static void     kbd_check_work(void)
          * and causes it to ignore the response to punish our
          * hastiness).
          */
+        /* A real keyboard holds an Inquiry for up to 1/4s until a key
+         * comes, rather than answering "nothing" straight away; doing that
+         * saves the Mac from polling (and busy-waiting in its keyboard
+         * interrupt handler) 100 times a second.
+         */
+        uint64_t wait = UMAC_EXECLOOP_QUANTUM;
+        if (kbd_last_cmd == KBD_CMD_INQUIRY && kbd_pending_evt == -1)
+                wait = 250000;
         if (kbd_last_cmd &&
-            ((global_time_us - kbd_last_cmd_time) > UMAC_EXECLOOP_QUANTUM)) {
+            ((global_time_us - kbd_last_cmd_time) > wait)) {
                 MDBG("KBD: got cmd 0x%x\n", kbd_last_cmd);
                 kbd_rx(kbd_last_cmd);
                 kbd_last_cmd = 0;
