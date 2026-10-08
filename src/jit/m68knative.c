@@ -643,6 +643,375 @@ static uint32_t set_cursor(jregs_t *j, uint32_t pc, uint32_t *ninstr)
         return ret;
 }
 
+/* Flags of add (dst + src) of size bytes, X too */
+static void flags_add(jregs_t *j, uint32_t dst, uint32_t src, int size)
+{
+        int sh = 8 * size - 8;
+        uint32_t m = size == 4 ? 0xffffffffu : (1u << (8 * size)) - 1;
+        dst &= m;
+        src &= m;
+        uint32_t res = (dst + src) & m;
+        j->n = (res >> sh) & 0x80;
+        j->not_z = res;
+        j->v = (((src ^ res) & (dst ^ res)) >> sh) & 0x80;
+        j->x = j->c = res < dst ? 0x100 : 0;
+}
+
+/* Loops can't run away: past this many instructions, stop at the loop
+ * head and let the ROM (and interrupts) have a go.
+ */
+#define LOOP_CAP 20000
+
+/* QuickDraw: intersection of D0.w rects (SectRect and friends), Pascal
+ * frame (count.w at 12(A6), then pointers), result rect at 8(A6).
+ *
+ *  40a110  link    A6, #$0             40a14c  cmp.w   D1, D3
+ *  40a114  movem.l D1-D4/A1, -(A7)     40a14e  ble     $40a15a
+ *  40a118  lea     ($c,A6), A1         40a150  cmp.w   D2, D4
+ *  40a11c  move.w  (A1)+, D0           40a152  ble     $40a15a
+ *  40a11e  ble     $40a15a             40a154  dbra    D0, $40a12a
+ *  40a120  movea.l (A1)+, A0           40a158  bra     $40a162
+ *  40a122  movem.w (A0)+, D1-D4        40a15a  clr.w   D1 (.. D4)
+ *  40a126  subq.w  #1, D0              40a162  movea.l ($8,A6), A0
+ *  40a128  bra     $40a14c             40a166  move.w  D1, (A0)+ (.. D4)
+ *  40a12a  movea.l (A1)+, A0           40a16e  move.w  ($c,A6), D0
+ *  40a12c  cmp.w   (A0)+, D1           40a172  lsl.w   #2, D0
+ *  40a12e  bge     $40a134             40a174  addq.w  #6, D0
+ *  40a130  move.w  (-$2,A0), D1        40a176  cmp.w   D1, D3
+ *  ...     (D2 bge, D3 ble, D4 ble)    40a178  movem.l (A7)+, D1-D4/A1
+ *                                      40a17c  unlk    A6
+ *                                      40a17e  movea.l (A7)+, A0
+ *                                      40a180  adda.w  D0, A7
+ *                                      40a182  jmp     (A0)
+ */
+static uint32_t sect_rects(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        push32(j, A(6));
+        A(6) = A(7);
+        static const int save[5] = { 9, 4, 3, 2, 1 };   /* A1, D4..D1 */
+        for (int i = 0; i < 5; i++)
+                push32(j, j->dar[save[i]]);
+        uint32_t a1 = A(6) + 0xc, a0;
+        uint32_t cnt = rd16(a1);
+        a1 += 2;
+        uint32_t n = 5;
+        int16_t r[4];
+        if ((int16_t)cnt <= 0) {
+                r[0] = r[1] = r[2] = r[3] = 0;
+                n += 4;
+        } else {
+                a0 = rd32(a1);
+                a1 += 4;
+                for (int i = 0; i < 4; i++)
+                        r[i] = (int16_t)rd16(a0 + 2 * i);
+                a0 += 8;
+                cnt = (cnt - 1) & 0xffff;
+                n += 4;                                 /* movea, movem, subq, bra */
+                for (;;) {
+                        n += 2;
+                        if (r[2] <= r[0])
+                                goto empty;
+                        n += 2;
+                        if (r[3] <= r[1])
+                                goto empty;
+                        n++;                            /* dbra */
+                        cnt = (cnt - 1) & 0xffff;
+                        if (cnt == 0xffff) {
+                                n++;                    /* bra */
+                                break;
+                        }
+                        a0 = rd32(a1);
+                        a1 += 4;
+                        n += 1 + 8;
+                        for (int i = 0; i < 4; i++) {
+                                int16_t v = (int16_t)rd16(a0 + 2 * i);
+                                if (i < 2 ? r[i] < v : r[i] > v) {
+                                        r[i] = v;
+                                        n++;
+                                }
+                        }
+                        a0 += 8;
+                        continue;
+empty:
+                        r[0] = r[1] = r[2] = r[3] = 0;
+                        n += 4;
+                        break;
+                }
+        }
+        uint32_t dst = rd32(A(6) + 8);
+        for (int i = 0; i < 4; i++)
+                wr16(dst + 2 * i, (uint16_t)r[i]);
+        uint32_t c = rd16(A(6) + 0xc);
+        uint32_t sh = (c << 2) & 0xffff;
+        uint32_t d0 = (sh + 6) & 0xffff;
+        D(0) = (D(0) & 0xffff0000u) | d0;
+        j->x = d0 < 6 ? 0x100 : 0;                      /* addq.w's carry */
+        flags_cmp(j, (uint16_t)r[2], (uint16_t)r[0], 2);
+        for (int i = 4; i >= 0; i--)                    /* D1..D4, A1 */
+                j->dar[save[i]] = rd32(A(7) + 4 * (4 - i));
+        A(7) = A(6);
+        A(6) = rd32(A(7));
+        uint32_t ret = rd32(A(7) + 4);
+        A(0) = ret;
+        A(7) += 8 + (uint32_t)(int16_t)d0;
+        *ninstr = n + 14;       /* movea, 4 moves, move/lsl/addq/cmp, movem, unlk, movea, adda, jmp */
+        return ret;
+}
+
+/* Resource Manager: scan D4.w+1 12-byte reference entries at A2 for the
+ * biggest data offset (masked by $31A) that is below D2 and above D7;
+ * keeps it in D7 and its entry in D6.
+ *
+ *  4138ca  move.l  ($4,A2), D0
+ *  4138ce  and.l   $31a.w, D0
+ *  4138d2  cmp.l   D0, D2
+ *  4138d4  bge     $4138de
+ *  4138d6  cmp.l   D0, D7
+ *  4138d8  ble     $4138de
+ *  4138da  move.l  D0, D7
+ *  4138dc  move.l  A2, D6
+ *  4138de  adda.w  #$c, A2
+ *  4138e2  dbra    D4, $4138ca
+ */
+static uint32_t ref_max_below(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t mask = rd32(0x31a), n = 0, d4 = D(4) & 0xffff;
+        for (;;) {
+                uint32_t d0 = rd32(A(2) + 4) & mask;
+                D(0) = d0;
+                flags_cmp(j, D(2), d0, 4);
+                n += 4;
+                if ((int32_t)D(2) < (int32_t)d0) {
+                        flags_cmp(j, D(7), d0, 4);
+                        n += 2;
+                        if ((int32_t)D(7) > (int32_t)d0) {
+                                D(7) = d0;
+                                D(6) = A(2);
+                                flags_logic(j, D(6), 4);
+                                n += 2;
+                        }
+                }
+                A(2) += 0xc;
+                n += 2;
+                d4 = (d4 - 1) & 0xffff;
+                if (d4 == 0xffff) {
+                        set_w(&D(4), d4);
+                        *ninstr = n;
+                        return 0x4138e6;
+                }
+                if (n >= LOOP_CAP) {
+                        set_w(&D(4), d4);
+                        *ninstr = n;
+                        return 0x4138ca;
+                }
+        }
+}
+
+/* Resource Manager: find handle A1 among all the references of a map
+ * (type entries at A0, refs at A2): what AddResource and friends use to
+ * check a handle isn't a resource already.
+ *
+ *  41405e  addq.w  #2, A0
+ *  414060  addq.w  #8, A2
+ *  414062  cmpa.l  (A2)+, A1
+ *  414064  dbeq    D4, $414060
+ *  414068  beq     $41407e
+ *  41406a  move.l  (A0)+, D3
+ *  41406c  move.w  (A0)+, D4
+ *  41406e  dbra    D5, $41405e
+ *  414072  ...                       (not in this map)
+ */
+static uint32_t ref_find_handle(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t n = 0, a0 = A(0), a2 = A(2), a1 = A(1), d4 = D(4) & 0xffff, d5 = D(5) & 0xffff;
+        for (;;) {
+                a0 += 2;
+                n++;
+                int eq;
+                for (;;) {
+                        a2 += 8;
+                        uint32_t m = rd32(a2);
+                        a2 += 4;
+                        n += 3;
+                        flags_cmp(j, a1, m, 4);
+                        eq = m == a1;
+                        if (eq)
+                                break;
+                        d4 = (d4 - 1) & 0xffff;
+                        if (d4 == 0xffff)
+                                break;
+                }
+                n++;                                    /* beq */
+                if (eq) {
+                        A(0) = a0;
+                        A(2) = a2;
+                        set_w(&D(4), d4);
+                        set_w(&D(5), d5);
+                        *ninstr = n;
+                        return 0x41407e;
+                }
+                D(3) = rd32(a0);
+                d4 = rd16(a0 + 4);
+                a0 += 6;
+                flags_logic(j, d4, 2);
+                n += 3;
+                d5 = (d5 - 1) & 0xffff;
+                if (d5 == 0xffff || n >= LOOP_CAP) {
+                        A(0) = a0;
+                        A(2) = a2;
+                        set_w(&D(4), d4);
+                        set_w(&D(5), d5);
+                        *ninstr = n;
+                        return d5 == 0xffff ? 0x414072 : 0x41405e;
+                }
+        }
+}
+
+/* Memory Manager: walk the heap zone at A6 from block A1 for a free block
+ * of at least D0 bytes (D2 = the address mask), merging each free block
+ * with the free blocks after it.  Leaves at 4106ec when it reaches the
+ * zone's end (bkLim at (A6)), at 4106e8 with the block in A1.
+ *
+ *  4106c2  cmpa.l  (A6), A1            4106d2  movea.l A1, A0
+ *  4106c4  bcc     $4106ec             4106d4  adda.l  D1, A0
+ *  4106c6  move.l  (A1), D1            4106d6  tst.b   (A0)
+ *  4106c8  tst.b   (A1)                4106d8  bne     $4106e4
+ *  4106ca  beq     $4106d2             4106da  cmpa.l  (A6), A0
+ *  4106cc  and.l   D2, D1              4106dc  bcc     $4106e4
+ *  4106ce  adda.l  D1, A1              4106de  add.l   (A0), D1
+ *  4106d0  bra     $4106c2             4106e0  move.l  D1, (A1)
+ *                                      4106e2  bra     $4106d2
+ *                                      4106e4  cmp.l   D0, D1
+ *                                      4106e6  bcs     $4106cc
+ */
+static uint32_t heap_find_free(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t n = 0, a1 = A(1), d1 = D(1);
+        for (;;) {
+                uint32_t lim = rd32(A(6));
+                flags_cmp(j, a1, lim, 4);
+                n += 2;
+                if (a1 >= lim) {
+                        A(1) = a1;
+                        D(1) = d1;
+                        *ninstr = n;
+                        return 0x4106ec;
+                }
+                d1 = rd32(a1);
+                uint32_t tag = rd8(a1);
+                flags_logic(j, tag, 1);
+                n += 3;
+                if (!tag) {
+                        /* free: merge the free blocks after it */
+                        for (;;) {
+                                uint32_t a0 = a1 + d1, t2 = rd8(a0);
+                                A(0) = a0;
+                                flags_logic(j, t2, 1);
+                                n += 4;
+                                if (t2)
+                                        break;
+                                uint32_t lim2 = rd32(A(6));
+                                flags_cmp(j, a0, lim2, 4);
+                                n += 2;
+                                if (a0 >= lim2)
+                                        break;
+                                uint32_t s = rd32(a0);
+                                flags_add(j, d1, s, 4);
+                                d1 += s;
+                                wr32(a1, d1);
+                                {
+                                        uint32_t x = j->x;
+                                        flags_logic(j, d1, 4);
+                                        j->x = x;
+                                }
+                                n += 3;
+                                if (n >= LOOP_CAP) {
+                                        A(1) = a1;
+                                        D(1) = d1;
+                                        *ninstr = n;
+                                        return 0x4106d2;
+                                }
+                        }
+                        flags_cmp(j, d1, D(0), 4);
+                        n += 2;
+                        if (d1 >= D(0)) {
+                                A(1) = a1;
+                                D(1) = d1;
+                                *ninstr = n;
+                                return 0x4106e8;
+                        }
+                }
+                d1 &= D(2);
+                flags_logic(j, d1, 4);
+                a1 += d1;
+                n += 3;
+                if (n >= LOOP_CAP) {
+                        A(1) = a1;
+                        D(1) = d1;
+                        *ninstr = n;
+                        return 0x4106c2;
+                }
+        }
+}
+
+/* Window Manager FrontWindow: the first visible window in WindowList
+ * ($9D6) that isn't the ghost window ($A84); nil while $8F2 is set.
+ *
+ *  411d72  clr.l   ($4,A7)             411d8a  tst.b   ($6e,A0)
+ *  411d76  tst.b   $8f2.w              411d8e  bne     $411d96
+ *  411d7a  bne     $411d9a             411d90  movea.l ($90,A0), A0
+ *  411d7c  movea.l $9d6.w, A0          411d94  bra     $411d80
+ *  411d80  move.l  A0, D0              411d96  move.l  A0, ($4,A7)
+ *  411d82  beq     $411d96             411d9a  rts
+ *  411d84  cmpa.l  $a84.w, A0
+ *  411d88  beq     $411d90
+ */
+static uint32_t front_window(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t n = 3;
+        wr32(A(7) + 4, 0);
+        uint32_t b = rd8(0x8f2);
+        flags_logic(j, b, 1);
+        if (!b) {
+                uint32_t a0 = rd32(0x9d6), ghost = rd32(0xa84);
+                n++;
+                for (;;) {
+                        D(0) = a0;
+                        flags_logic(j, a0, 4);
+                        n += 2;
+                        if (!a0)
+                                break;
+                        flags_cmp(j, a0, ghost, 4);
+                        n += 2;
+                        if (a0 != ghost) {
+                                uint32_t v = rd8(a0 + 0x6e);
+                                flags_logic(j, v, 1);
+                                n += 2;
+                                if (v)
+                                        break;
+                        }
+                        a0 = rd32(a0 + 0x90);
+                        n += 2;
+                        if (n >= LOOP_CAP) {
+                                A(0) = a0;
+                                *ninstr = n;
+                                return 0x411d80;
+                        }
+                }
+                A(0) = a0;
+                wr32(A(7) + 4, a0);
+                flags_logic(j, a0, 4);
+                n++;
+        }
+        *ninstr = n + 1;
+        return rts(j);
+}
+
 /* SystemTask: walk the unit table for drivers that are open, not busy
  * and want periodic time.  Skips entries that don't qualify; at one that
  * does, stops just after its test (415dc2), leaving the ROM to run it.
@@ -1402,6 +1771,11 @@ out:
 const m68k_native_t m68k_natives[] = {
         { 0x413dee, get_resource, "GetResource" },
         { 0x401e0a, set_cursor, "SetCursor" },
+        { 0x40a110, sect_rects, "rect intersection" },
+        { 0x4138ca, ref_max_below, "ref scan (max below)" },
+        { 0x41405e, ref_find_handle, "ref scan (handle)" },
+        { 0x4106c2, heap_find_free, "heap free-block search" },
+        { 0x411d72, front_window, "FrontWindow" },
         { 0x413f10, find_ref_id, "find resource ID" },
         { 0x413f1e, find_type, "find resource type" },
         { 0x415dac, unit_scan, "SystemTask driver scan" },
