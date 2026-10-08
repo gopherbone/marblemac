@@ -106,6 +106,12 @@ int main(int argc, char **argv)
         disk_fp = fopen(argv[2], "rb");
         fseek(disk_fp, 0, SEEK_END);
         vdisk_init(&vd, ftell(disk_fp), base_read, NULL, host_realloc);
+        if (getenv("OVL")) {
+                /* Start from a saved overlay (disk.ovl from the device) */
+                size_t on;
+                uint8_t *o = slurp(getenv("OVL"), &on);
+                printf("load %s: %s\n", getenv("OVL"), vdisk_load_overlay(&vd, o, (uint32_t)on) < 0 ? "REJECTED" : "ok");
+        }
         d[0].size = vd.size;
         d[0].op_ctx = &vd;
         d[0].op_read = vdisk_read;

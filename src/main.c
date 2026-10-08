@@ -209,7 +209,12 @@ static void save_disk(void)
                 vdisk.dirty = 1;
                 return;
         }
-        pd->file->unlink(OVERLAY_FILE, 0);
+        /* Keep the previous save: the Mac's file system is live when we
+         * snapshot it (catalog changes can still be sitting in its caches),
+         * so a save can occasionally catch a file mid-update.
+         */
+        pd->file->unlink(OVERLAY_FILE ".prev", 0);
+        pd->file->rename(OVERLAY_FILE, OVERLAY_FILE ".prev");
         pd->file->rename(OVERLAY_FILE ".tmp", OVERLAY_FILE);
 }
 
@@ -422,9 +427,12 @@ static void emu_quantum(void)
         }
 }
 
+static int paced;               /* display refresh capped (the Mac is keeping up) */
+
 static void emu_run(unsigned int wall_dt_ms)
 {
         unsigned int start = pd->system->getCurrentTimeMilliseconds();
+        int behind = 0;
 
         target_us += (uint64_t)wall_dt_ms * 1000;
         if (target_us > emu_us + MAX_LAG_US)
@@ -435,8 +443,17 @@ static void emu_run(unsigned int wall_dt_ms)
                 if (pd->system->getCurrentTimeMilliseconds() - start >= EMU_BUDGET_MS) {
                         /* Can't keep up: let the Mac run slow instead of spiralling */
                         target_us = emu_us;
+                        behind = 1;
                         break;
                 }
+        }
+        /* Keeping up (often idle): no point drawing faster than the
+         * display's 50Hz.  Behind: unpaced, so a frame that overruns a
+         * 20ms slot doesn't then wait for the next one.
+         */
+        if (behind == paced) {
+                paced = !behind;
+                pd->display->setRefreshRate(paced ? 50 : 0);
         }
 }
 
