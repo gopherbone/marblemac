@@ -446,7 +446,7 @@ static void mac_reset(void *ud)
  * on the display get copied and marked: the LCD transfer is the slow
  * part, and while the Mac sits still most rows don't change.
  */
-static uint8_t back[LCD_ROWS * LCD_ROWSIZE];
+static uint8_t back[LCD_ROWS * LCD_ROWSIZE] __attribute__((aligned(4)));
 
 static void present(void)
 {
@@ -488,19 +488,22 @@ static void blit(void)
         if (mac_ready)
                 mac_erase_cursor(&undo);
 
-        /* Mac is 1=black, Playdate is 1=white.  The last source byte read
-         * may run one past the row (or the framebuffer, into the RAM
-         * after it), which is harmless.
+        /* Mac is 1=black, Playdate is 1=white.  A word at a time, 13 per
+         * row (covering the 2 padding bytes); the last reads run a few
+         * bytes past the row (or the framebuffer, into the RAM after it),
+         * which is harmless.
          */
         for (int y = 0; y < LCD_ROWS; y++) {
                 const uint8_t *src = fb + (cy + y) * MAC_STRIDE + b;
                 uint8_t *dst = frame + y * LCD_ROWSIZE;
-                if (s == 0) {
-                        for (int i = 0; i < LCD_COLUMNS / 8; i++)
-                                dst[i] = ~src[i];
-                } else {
-                        for (int i = 0; i < LCD_COLUMNS / 8; i++)
-                                dst[i] = ~((src[i] << s) | (src[i + 1] >> (8 - s)));
+                for (int i = 0; i < LCD_ROWSIZE; i += 4) {
+                        uint32_t w;
+                        memcpy(&w, src + i, 4);
+                        w = __builtin_bswap32(w);
+                        if (s)
+                                w = w << s | src[i + 4] >> (8 - s);
+                        w = ~__builtin_bswap32(w);
+                        memcpy(dst + i, &w, 4);
                 }
         }
 
@@ -517,7 +520,6 @@ static void blit(void)
                                     (int)mx - cx, (int)my - cy, cursor_rotation(&c));
                 }
         }
-
         present();
 }
 
@@ -572,9 +574,32 @@ static void draw_fatal(void)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+#ifdef MARBLE_FRAMEPROF
+/* Where a frame's time goes: input+physics, emulation, drawing, overlays,
+ * and whatever the system does between our update() calls.
+ */
+static float fp_t[5], fp_last_end;
+static int fp_frames;
+#define FP_MARK(i) do { float _t = pd->system->getElapsedTime(); fp_t[i] += _t - fp_mark; fp_mark = _t; } while (0)
+#else
+#define FP_MARK(i) do { } while (0)
+#endif
+
 static int update(void *ud)
 {
         (void)ud;
+#ifdef MARBLE_FRAMEPROF
+        float fp_mark = pd->system->getElapsedTime();
+        if (fp_last_end > 0)
+                fp_t[4] += fp_mark - fp_last_end;
+        if (++fp_frames == 100) {
+                pd->system->logToConsole("frame ms: input %.2f emu %.2f blit %.2f overlay %.2f system %.2f",
+                                         (double)(fp_t[0] * 10), (double)(fp_t[1] * 10), (double)(fp_t[2] * 10),
+                                         (double)(fp_t[3] * 10), (double)(fp_t[4] * 10));
+                memset(fp_t, 0, sizeof fp_t);
+                fp_frames = 0;
+        }
+#endif
         if (fatal_msg) {
                 draw_fatal();
                 return 1;
@@ -619,13 +644,20 @@ static int update(void *ud)
         }
         umac_mouse(0, 0, (cur & kButtonA) ? 1 : 0);
         clickfx_step(cur & kButtonA, vx, vy, dt);
+        FP_MARK(0);
 
         emu_run(dt_ms);
+        FP_MARK(1);
 
         step_camera(dt);
         blit();
+        FP_MARK(2);
         draw_stats(now);
         tuning_draw();
+        FP_MARK(3);
+#ifdef MARBLE_FRAMEPROF
+        fp_last_end = pd->system->getElapsedTime();
+#endif
         return 1;
 }
 
