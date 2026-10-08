@@ -22,6 +22,7 @@ enum {
         JH_RTE,                         /* uint32 f(pc): RTE -> next pc */
         JH_INTERP,                      /* uint32 f(pc): one instruction via Musashi -> next pc */
         JH_MOVEM,                       /* void f(addr, spec): MOVEM (see tr_movem) */
+        JH_NATIVE,                      /* uint32 f(index, pc): native ROM routine -> next pc */
         JH_COUNT
 };
 
@@ -36,6 +37,7 @@ typedef struct {
         uint32_t x, n, not_z, v, c;     /* Musashi flag formats */
         int32_t budget;         /* instructions left before returning */
         uint32_t lastexit;      /* chainable exit just taken (index + 1), or 0 */
+        uint32_t native_n;      /* 68k instructions the last native routine stood in for */
 } jregs_t;
 
 typedef struct {
@@ -67,6 +69,7 @@ typedef struct {
         uint32_t stale;         /* block's page was invalidated */
         uint32_t smc_exits;     /* store sites that can leave a block early */
         uint32_t follows;       /* unconditional jumps folded into traces */
+        uint32_t native_calls;  /* native ROM routines run */
         uint64_t code_bytes;    /* generated */
         uint32_t chains;        /* exits linked straight to the next block */
         float t_run, t_xlat, t_interp, t_total;   /* seconds, if platform has now() */

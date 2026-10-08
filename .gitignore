@@ -12,3 +12,6 @@ disk.ovl
 .git.upstream
 
 .DS_Store
+
+# Claude Code worktrees
+.claude/

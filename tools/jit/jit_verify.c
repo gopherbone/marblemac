@@ -99,7 +99,7 @@ static int ophist_on;
 static const char *ophist_name[] = { "mrs", "msr", "bl", "ldr/str [r4] (regfile)", "ldr/str other",
         "mov/movw/movt", "b/bcc/cbz", "subs r7 (budget)", "push/pop", "dp/other 16", "dp/other 32" };
 static uint64_t ophist[11][2];
-static uint64_t ophist_reload, ophist_reload_any;
+static uint64_t ophist_reload, ophist_reload_any, ophist_w32, ophist_w32_odd, ophist_w32_cross;
 static void ophist_count(uc_engine *u, uint32_t a, uint32_t size)
 {
         uint16_t h[2] = { 0, 0 };
@@ -125,6 +125,11 @@ static void ophist_count(uc_engine *u, uint32_t a, uint32_t size)
         }
         ophist[k][0]++;
         ophist[k][1] += size;
+        if (size == 4) {
+                ophist_w32++;
+                ophist_w32_odd += (a & 2) != 0;
+                ophist_w32_cross += (a & 7) == 6;
+        }
         /* ldr r,[r4,#n] right after str r,[r4,#n] (16-bit forms only) */
         static uint16_t prev;
         if (size == 2 && (h1 & 0xF800) == 0x6800 && (prev & 0xF800) == 0x6000 && (h1 & 0x7FF) == (prev & 0x7FF))
@@ -142,7 +147,9 @@ static void ophist_report(void)
                         100.0 * ophist[k][0] / n, 100.0 * ophist[k][1] / b);
         fprintf(stderr, "  reload of a just-stored slot: %llu same reg, %llu any reg\n",
                 (unsigned long long)ophist_reload, (unsigned long long)ophist_reload_any);
-        ophist_reload = ophist_reload_any = 0;
+        fprintf(stderr, "  32-bit instrs: %.1f%% at 2 mod 4, %.1f%% straddling 8-byte fetch\n",
+                100.0 * ophist_w32_odd / ophist_w32, 100.0 * ophist_w32_cross / ophist_w32);
+        ophist_reload = ophist_reload_any = ophist_w32 = ophist_w32_odd = ophist_w32_cross = 0;
         memset(ophist, 0, sizeof ophist);
 }
 static void sim_fetch(uc_engine *u, uint64_t address, uint32_t size, void *ud)
@@ -188,6 +195,76 @@ static void sim_data(uc_engine *u, uc_mem_type type, uint64_t address, int size,
 }
 
 static uint64_t helper_calls[JH_COUNT];
+
+/* TRAPS: attribute each 68k instruction (of verified runs) to the A-line
+ * traps it runs inside.  A trap is on the stack from its A-line until
+ * the PC is back after it, or SP is above where it was called (Pascal
+ * callees pop their arguments; auto-pop traps return further up).
+ */
+static int trapprof_on;
+static uint64_t trap_incl[4096], trap_excl[4096], trap_calls[4096], trap_none, trap_total;
+static struct { uint16_t trap; uint32_t ret, sp; } tstack[64];
+static int tdepth;
+static uint32_t tseen[4096], tgen;
+static uint8_t *trap_ram, *trap_rom;
+static void trapprof_step(void)
+{
+        uint32_t pc = m68ki_cpu.pc & 0xffffff, sp = m68ki_cpu.dar[15];
+        while (tdepth && (sp > tstack[tdepth - 1].sp ||
+                          (pc == tstack[tdepth - 1].ret && sp == tstack[tdepth - 1].sp)))
+                tdepth--;
+        trap_total++;
+        tgen++;
+        for (int i = 0; i < tdepth; i++) {
+                int t = tstack[i].trap;
+                if (tseen[t] != tgen) {
+                        tseen[t] = tgen;
+                        trap_incl[t]++;
+                }
+        }
+        if (tdepth)
+                trap_excl[tstack[tdepth - 1].trap]++;
+        else
+                trap_none++;
+        uint32_t op = 0;
+        if (pc + 1 < RAM_SIZE)
+                op = trap_ram[pc] << 8 | trap_ram[pc + 1];
+        else if ((pc & 0xf00000) == 0x400000)
+                op = trap_rom[pc & (ROM_SIZE - 1)] << 8 | trap_rom[(pc & (ROM_SIZE - 1)) + 1];
+        if ((op & 0xf000) == 0xa000) {
+                /* Toolbox traps: 10-bit number (bit 11 set); OS: 8-bit */
+                int t = (op & 0x800) ? 0x800 | (op & 0x3ff) : op & 0xff;
+                trap_calls[t]++;
+                if (tdepth == 64)
+                        tdepth--;
+                tstack[tdepth].trap = t;
+                tstack[tdepth].ret = pc + 2;
+                tstack[tdepth].sp = sp;
+                tdepth++;
+        }
+}
+
+static void trapprof_report(const char *when)
+{
+        static int idx[4096];
+        for (int i = 0; i < 4096; i++) idx[i] = i;
+        for (int pass = 0; pass < 2; pass++) {
+                uint64_t *v = pass ? trap_excl : trap_incl;
+                for (int i = 0; i < 4096; i++)          /* selection of the top 30 */
+                        for (int j = i + 1; j < 4096 && i < 30; j++)
+                                if (v[idx[j]] > v[idx[i]]) { int x = idx[i]; idx[i] = idx[j]; idx[j] = x; }
+                fprintf(stderr, "[%s] traps by %s time (of %llu instrs; %.1f%% outside any trap):\n", when,
+                        pass ? "exclusive" : "inclusive", (unsigned long long)trap_total, 100.0 * trap_none / trap_total);
+                for (int i = 0; i < 30 && v[idx[i]]; i++) {
+                        int t = idx[i];
+                        fprintf(stderr, "  %s %03X  %5.1f%%  calls %-7llu  %llu instrs/call\n", t & 0x800 ? "TB" : "OS",
+                                t & 0x7ff, 100.0 * v[t] / trap_total, (unsigned long long)trap_calls[t],
+                                (unsigned long long)(trap_calls[t] ? trap_incl[t] / trap_calls[t] : 0));
+                }
+        }
+        memset(trap_incl, 0, sizeof trap_incl); memset(trap_excl, 0, sizeof trap_excl);
+        memset(trap_calls, 0, sizeof trap_calls); trap_none = trap_total = 0;
+}
 static void sim_report(const char *when)
 {
         /* Measured on the device: random PSRAM miss ~1.5us; the next line
@@ -607,6 +684,8 @@ static uint32_t plat_run(void *entry, void *code, jregs_t *regs)
         for (uint32_t i = 0; i < n; i++) {
                 if (iexec)
                         iexec[m68ki_cpu.pc & 0xffffff]++;
+                if (trapprof_on)
+                        trapprof_step();
                 if (nmus_pcs < 8192)
                         mus_pcs[nmus_pcs++] = m68ki_cpu.pc;
                 m68k_step_one();
@@ -872,12 +951,12 @@ static void report(const char *when)
         m68kjit_stats_t *s = &m68k_jit_stats;
         double tot = (double)(s->jit_instrs + s->interp_instrs);
         fprintf(stderr, "[%s] t=%.1fs  jit %llu (%.1f%%)  interp %llu  blocks %llu  avg %.1f/blk  "
-                "translations %u (conflict %u stale %u recycles %u, %.0f B/blk, chains %u)  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
+                "translations %u (conflict %u stale %u recycles %u, %.0f B/blk, chains %u)  natives %u  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
                 when, t_us / 1e6, (unsigned long long)s->jit_instrs, tot ? 100.0 * s->jit_instrs / tot : 0,
                 (unsigned long long)s->interp_instrs, (unsigned long long)s->blocks,
                 s->blocks ? (double)s->jit_instrs / s->blocks : 0,
                 s->translations, s->conflicts, s->stale, s->recycles,
-                s->translations ? (double)s->code_bytes / s->translations : 0, s->chains, s->flushes, (unsigned long long)verified,
+                s->translations ? (double)s->code_bytes / s->translations : 0, s->chains, s->native_calls, s->flushes, (unsigned long long)verified,
                 (unsigned long long)unverified, (unsigned long long)mismatches);
 }
 
@@ -980,6 +1059,8 @@ int main(int argc, char **argv)
         m68k_jit_no_follow = getenv("NOFOLLOW") != NULL;
         extern int m68k_jit_fused_ea;
         m68k_jit_fused_ea = getenv("FUSED") != NULL;
+        extern int m68k_jit_no_native;
+        m68k_jit_no_native = getenv("NONATIVE") != NULL;
         extern int m68k_jit_no_traces;
         m68k_jit_no_traces = getenv("NOTRACE") != NULL;
         extern int m68k_jit_max_budget;
@@ -1081,6 +1162,14 @@ int main(int argc, char **argv)
                                 m68k_jit_size_observer = observe_size;
                         } else {
                                 size_report();
+                        }
+                } else if (!strcmp(argv[i], "traps")) {
+                        if (!trapprof_on) {
+                                trapprof_on = 1;
+                                trap_ram = ram;
+                                trap_rom = rom;
+                        } else {
+                                trapprof_report(argv[++i]);
                         }
                 } else if (!strcmp(argv[i], "sim")) {
                         sim_report(argv[++i]);

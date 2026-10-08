@@ -21,6 +21,7 @@
 #include <string.h>
 #include "m68kcpu.h"
 #include "m68kjit.h"
+#include "m68knative.h"
 #include "thumb.h"
 
 /* umac memory accessors (slow paths) */
@@ -87,6 +88,11 @@ static uint32_t npages;
 static jit_entry_t *table;
 static uint32_t gen = 1;
 static uint16_t *code_buf, *code_ptr, *code_end, *perm_end;
+/* Testing: start generated code this many bytes later, to tell code
+ * layout luck from real speedups */
+#ifndef JIT_CODE_SKEW
+#define JIT_CODE_SKEW 0
+#endif
 static uint16_t *entry_tramp;           /* uint32_t tramp(block | 1) */
 
 /* Chaining.  Every chainable exit gets a record (its patchable slot and
@@ -439,6 +445,26 @@ static void mv_write(uint32_t a, uint32_t v, int lng)
                 cpu_write_word(a, v & 0xffff);
 }
 
+/* Memory access for native routines (m68knative.c) */
+uint32_t m68k_jit_read(uint32_t addr, int size)
+{
+        return mv_read(addr, size == 4);
+}
+
+void m68k_jit_write(uint32_t addr, uint32_t v, int size)
+{
+        mv_write(addr, v, size == 4);
+}
+
+static uint32_t h_native(uint32_t idx, uint32_t pc)
+{
+        uint32_t n = 0;
+        uint32_t next = m68k_natives[idx].fn(J, pc, &n);
+        J->native_n = n;
+        m68k_jit_stats.native_calls++;
+        return next;
+}
+
 static uint32_t h_movem(uint32_t ea, uint32_t spec)
 {
         int lng = !!(spec & MV_LONG), size = lng ? 4 : 2, an = 8 + (spec >> 20 & 7);
@@ -528,7 +554,7 @@ static uint32_t h_movem(uint32_t ea, uint32_t spec)
 
 uint32_t (*const m68k_jit_helper_fn[JH_COUNT])(uint32_t, uint32_t) = {
         h_rd8, h_rd16, h_rd32, h_wr8, h_wr16, h_wr32, h_codewrite, h_aline,
-        h_getsr, h_srop, h_movetosr, h_rte, h_interp, h_movem,
+        h_getsr, h_srop, h_movetosr, h_rte, h_interp, h_movem, h_native,
 };
 
 /* -------------------------------------------------------------------- */
@@ -1900,6 +1926,24 @@ static int tr_rts(tctx_t *t)
         return 1;
 }
 
+int m68k_jit_no_native;         /* testing: run the ROM code instead */
+
+/* Block for a native ROM routine: call it, charge what it says the ROM
+ * code would have taken, and go on at the pc it returns.  (Flags are
+ * already in Musashi's format at a block start.)
+ */
+static void emit_native(tctx_t *t, int idx, uint32_t pc)
+{
+        t->pc = pc;
+        t_mov32(E, R0, (uint32_t)idx);
+        t_mov32(E, R1, pc);
+        call_helper(t, JH_NATIVE);
+        t_ldr(E, R1, R4, JR_OFF(native_n));
+        t_sub(E, R7, R7, R1);
+        t->f.r9kind = F_NONE;
+        emit_exit_reg(t, R0, 0);
+}
+
 static int tr_aline(tctx_t *t)
 {
         emit_flush_flags(t);            /* the helper builds SR from them */
@@ -2044,7 +2088,7 @@ static void recycle_code(void)
 {
         if (plat->recycle)
                 plat->recycle();
-        code_ptr = perm_end;
+        code_ptr = perm_end + JIT_CODE_SKEW / 2;
         flush_all();
         m68k_jit_stats.recycles++;
 }
@@ -2118,6 +2162,8 @@ static int can_follow(tctx_t *t, uint32_t target)
 {
         if (m68k_jit_no_follow || !chainable(target) || t->nranges + 1 >= MAX_RANGES)
                 return 0;
+        if (!m68k_jit_no_native && m68k_native_lookup(target) >= 0)
+                return 0;               /* it gets a block of its own */
         uint16_t pages[MAX_PAGES + 1];
         /* the range so far, plus room for code at the target (2 pages) */
         tctx_t tmp_unused;
@@ -2162,6 +2208,17 @@ static uint16_t *translate(uint32_t pc, jit_entry_t *ent)
                 uint16_t *mark = t->e.p;
                 fstate_t fmark = t->f;
                 int smark = t->nstubs;
+                int ni = m68k_jit_no_native ? -1 : m68k_native_lookup(at);
+                if (ni >= 0) {
+                        /* A native routine: alone in its block */
+                        if (t->count)
+                                break;
+                        emit_native(t, ni, at);
+                        at += 2;
+                        t->count++;
+                        ended = 1;
+                        break;
+                }
                 t->pc = at;
                 t->fetch = at + 2;
                 t->fail = 0;
@@ -2435,7 +2492,7 @@ static void emit_permanent(void)
 
         perm_end = (uint16_t *)(((uintptr_t)e->p + 31) & ~(uintptr_t)31);
         plat->code_written(code_buf, (uint32_t)((char *)e->p - (char *)code_buf));
-        code_ptr = perm_end;
+        code_ptr = perm_end + JIT_CODE_SKEW / 2;
 }
 
 int m68k_jit_init(const m68kjit_platform_t *p, uint8_t *r, uint32_t rsize,

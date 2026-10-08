@@ -50,6 +50,7 @@ set(SOURCES
 	src/clickfx.c
 	src/bungee.c
 	src/jit/m68kjit.c
+	src/jit/m68knative.c
 	src/jit_playdate.c
 	${UMAC}/src/main.c
 	${UMAC}/src/disc.c
