@@ -117,6 +117,8 @@ static int32_t *page_links;             /* per page: first link, -1 = none */
 static uint16_t *mat_fn[4][2];          /* materialise flags [kind][with X] */
 static uint16_t *rd_fn[5], *wr_fn[5];   /* shared memory access, by size (1, 2, 4) */
 static uint16_t *dyn_jump;              /* exit to a computed pc via the jump cache */
+static uint16_t *exit_common;           /* chainable exit stubs: r0 = exit index + 1 */
+static uint32_t *exit_pc;               /* per exit record: the 68k pc it leaves for */
 static uint16_t *rts_fn;                /* RTS: pop pc, then on via dyn_jump */
 /* Fused "address mode + access" entry points: [mode 0=(An) 1=(An)+ 2=-(An)]
  * [An][size 1,2,4].  rd: -> r0 = value.  wr: r1 = value.
@@ -983,10 +985,15 @@ static void emit_stub(tctx_t *t, stub_t *st)
                         emit_flush_flags(t);
                         t->f = now;
                 }
+                if (idx < MAX_EXITS) {
+                        /* exit_common stores lastexit and the pc */
+                        exit_pc[idx] = st->pc;
+                        t_mov32(E, R0, idx + 1);
+                        t_b_to(E, C_AL, exit_common);
+                        return;
+                }
                 t_mov32(E, R0, st->pc);
                 t_str(E, R0, R4, OFF_PC);
-                t_mov32(E, R0, idx < MAX_EXITS ? idx + 1 : 0);
-                t_str(E, R0, R4, OFF_LASTSLOT);
                 t16(E, 0xBD08);                 /* pop {r3, pc} */
                 return;
         }
@@ -2779,6 +2786,18 @@ static void emit_permanent(void)
         t_str(e, R2, R4, OFF_LASTSLOT);
         t16(e, 0xBD08);                         /* pop {r3, pc} */
 
+        /* exit_common: a chainable exit's stub branches here with r0 =
+         * its record's index + 1, for the dispatcher to link it.
+         */
+        if ((uintptr_t)e->p & 2)
+                t_nop(e);
+        exit_common = e->p;
+        t_str(e, R0, R4, OFF_LASTSLOT);
+        t_mov32(e, R1, plat->taddr(exit_pc) - 4);
+        t32(e, 0xF850 | R1, R1 << 12 | 2 << 4 | R0);  /* ldr.w r1, [r1, r0, lsl #2] */
+        t_str(e, R1, R4, OFF_PC);
+        t16(e, 0xBD08);                         /* pop {r3, pc} */
+
         /* Fused addressing-mode entry points, falling into rd_fn/wr_fn */
         for (int mode = 0; mode < 3; mode++) {
                 for (int an = 0; an < 8; an++) {
@@ -2842,9 +2861,10 @@ int m68k_jit_init(const m68kjit_platform_t *p, uint8_t *r, uint32_t rsize,
         codebits = plat->alloc(rsize / 16);
         page_gen = plat->alloc(npages * sizeof *page_gen);
         exits = plat->alloc(MAX_EXITS * sizeof *exits);
+        exit_pc = plat->alloc(MAX_EXITS * sizeof *exit_pc);
         links = plat->alloc(MAX_LINKS * sizeof *links);
         page_links = plat->alloc(npages * sizeof *page_links);
-        if (!codepage || !table || !code_buf || !codebits || !page_gen || !exits || !links || !page_links)
+        if (!codepage || !table || !code_buf || !codebits || !page_gen || !exits || !exit_pc || !links || !page_links)
                 return -1;
         for (uint32_t p = 0; p < npages; p++)
                 page_links[p] = -1;
