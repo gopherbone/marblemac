@@ -503,6 +503,28 @@ static void timing_input(void)
         umac_mouse(0, 0, button);
 }
 
+/* Checkpoint screenshots (raw Mac framebuffer, tools/pd2png.py makes a
+ * PNG) in the Data folder, to see what the script actually did */
+static void timing_shots(void)
+{
+        static const unsigned at[] = { 21, 24, 27, 30, 37, 45 };
+        static unsigned next;
+        if (next >= sizeof at / sizeof *at || emu_us < (uint64_t)at[next] * 1000000)
+                return;
+        char name[32];
+        snprintf(name, sizeof name, "shot_%02u.bin", at[next]);
+        SDFile *f = pd->file->open(name, kFileWrite);
+        if (f) {
+                const uint8_t *fb = mac_ram + umac_get_fb_offset();
+                static uint8_t inv[MAC_STRIDE * MAC_H];
+                for (unsigned i = 0; i < sizeof inv; i++)
+                        inv[i] = ~fb[i];
+                pd->file->write(f, inv, sizeof inv);
+                pd->file->close(f);
+        }
+        next++;
+}
+
 static void timing_run(void)
 {
         static float spent;
@@ -510,6 +532,7 @@ static void timing_run(void)
         unsigned int start = pd->system->getCurrentTimeMilliseconds();
         while (pd->system->getCurrentTimeMilliseconds() - start < EMU_BUDGET_MS) {
                 timing_input();
+                timing_shots();
                 float t0 = pd->system->getElapsedTime();
                 emu_quantum();
                 spent += pd->system->getElapsedTime() - t0;
@@ -755,13 +778,13 @@ static int update(void *ud)
         my = MAC_H / 2;
 #endif
         bungee_input(cur, pushed, panel_open, dt, mx, my, mac_ready);
+#ifndef MARBLE_TIMING           /* (there, timing_input() drives the mouse) */
         if (mac_ready) {
-#ifndef MARBLE_TIMING
                 step_marble(dt);
-#endif
                 mac_set_mouse((int)mx, (int)my);
         }
         umac_mouse(0, 0, (cur & kButtonA) ? 1 : 0);
+#endif
         clickfx_step(cur & kButtonA, vx, vy, dt);
         FP_MARK(0);
 
