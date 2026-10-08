@@ -190,12 +190,15 @@ static void sim_data(uc_engine *u, uc_mem_type type, uint64_t address, int size,
 static uint64_t helper_calls[JH_COUNT];
 static void sim_report(const char *when)
 {
-        /* Measured on the device: random PSRAM miss ~1.5us; streaming the
-         * next line ~0.15us; stores to PSRAM ~0.07us; ~180MHz core.
+        /* Measured on the device: random PSRAM miss ~1.5us; the next line
+         * of straight-line code ~0.75us (footprint bench); ~13ns per ARM
+         * instruction of JIT code when it's all cached; stores to PSRAM
+         * ~0.07us.  (Device time for whole workloads is still ~2-3x this:
+         * C helpers, the dispatcher and the OS aren't modelled.)
          */
-        double t = sim_arm_instrs * 1.2 / 180e6 +
+        double t = sim_arm_instrs * 13e-9 +
                    (icache.misses + dcache.misses) * 1.5e-6 +
-                   (icache.seq_misses + dcache.seq_misses) * 0.15e-6 +
+                   (icache.seq_misses + dcache.seq_misses) * 0.75e-6 +
                    sim_stores * 0.07e-6;
         fprintf(stderr, "[%s] model: %.0fM ARM instrs, I-miss %llu (+%llu seq), D-miss %llu (+%llu seq), stores %llu"
                 " => %.0f ms of device time\n", when, sim_arm_instrs / 1e6,
@@ -1014,6 +1017,31 @@ int main(int argc, char **argv)
                         m68k_jit_execute(8 * 400000);
                         fprintf(stderr, "%s: %llu instrs ", tests[k].name, (unsigned long long)m68k_jit_stats.jit_instrs);
                         sim_report(tests[k].name);
+                }
+                static const int reps[] = { 16, 64, 128, 256, 512, 1024 };
+                for (unsigned k = 0; k < sizeof reps / sizeof *reps; k++) {
+                        static const uint16_t body[4] = { 0xD481, 0xD682, 0xB781, 0x5281 };
+                        uint32_t a = 0x10000;
+                        for (int i = 0; i < reps[k]; i++)
+                                for (int j = 0; j < 4; j++, a += 2)
+                                        ram[a] = body[j] >> 8, ram[a + 1] = body[j] & 0xff;
+                        uint16_t d = (uint16_t)(0x10000 - (a + 2));
+                        ram[a] = 0x60; ram[a + 1] = 0x00; ram[a + 2] = d >> 8; ram[a + 3] = d & 0xff;
+                        m68k_jit_note_write(0x10000, a + 4 - 0x10000);
+                        overlay = 0;
+                        m68k_set_reg(M68K_REG_PC, 0x10000);
+                        uint64_t b0 = m68k_jit_stats.code_bytes;
+                        uint32_t t0 = m68k_jit_stats.translations;
+                        m68k_jit_execute(8 * (reps[k] * 12 + 1000));
+                        sim_report("warmup");
+                        m68k_jit_stats.jit_instrs = 0;
+                        uint64_t blk0 = m68k_jit_stats.blocks;
+                        m68k_jit_execute(8 * 400000);
+                        fprintf(stderr, "footprint %d: %llu code bytes, %u translations, %llu instrs, %llu dispatches ",
+                                reps[k] * 4 + 1, (unsigned long long)(m68k_jit_stats.code_bytes - b0),
+                                m68k_jit_stats.translations - t0, (unsigned long long)m68k_jit_stats.jit_instrs,
+                                (unsigned long long)(m68k_jit_stats.blocks - blk0));
+                        sim_report("footprint");
                 }
                 return 0;
         }

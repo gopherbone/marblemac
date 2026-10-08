@@ -174,7 +174,12 @@ static int open_disk(void)
 
         unsigned int olen;
         int dummy;
+#ifdef MARBLE_TIMING
+        uint8_t *ovl = NULL;            /* always the same fresh disk */
+        (void)olen; (void)dummy;
+#else
         uint8_t *ovl = load_file(OVERLAY_FILE, &olen, &dummy);
+#endif
         if (ovl) {
                 if (vdisk_load_overlay(&vdisk, ovl, olen) < 0)
                         pd->system->logToConsole("Ignoring " OVERLAY_FILE " (doesn't match " DISK_FILE ")");
@@ -185,6 +190,9 @@ static int open_disk(void)
 
 static void save_disk(void)
 {
+#ifdef MARBLE_TIMING
+        return;
+#endif
         if (!have_disk || !vdisk.dirty)
                 return;
 
@@ -432,6 +440,32 @@ static void emu_run(unsigned int wall_dt_ms)
         }
 }
 
+#ifdef MARBLE_TIMING
+/* Repeatable device benchmark: boot the same fresh disk with no input,
+ * emulating flat out, and log the device time each 5 emulated seconds
+ * took.  (Build with -DMARBLE_TIMING.)
+ */
+static void timing_run(void)
+{
+        static float spent;
+        static uint64_t next_mark = 5000000;
+        unsigned int start = pd->system->getCurrentTimeMilliseconds();
+        while (pd->system->getCurrentTimeMilliseconds() - start < EMU_BUDGET_MS) {
+                float t0 = pd->system->getElapsedTime();
+                emu_quantum();
+                spent += pd->system->getElapsedTime() - t0;
+                if (emu_us >= next_mark) {
+                        pd->system->logToConsole("timing: emulated %2us-%2us took %.0f ms",
+                                                 (unsigned)(next_mark / 1000000 - 5), (unsigned)(next_mark / 1000000),
+                                                 (double)(spent * 1000));
+                        spent = 0;
+                        next_mark += 5000000;
+                }
+        }
+        target_us = emu_us;
+}
+#endif
+
 static void mac_reset(void *ud)
 {
         (void)ud;
@@ -623,8 +657,16 @@ static int update(void *ud)
         {
                 extern void jit_probe_step(PlaydateAPI *pd);
                 static int frames;
+                /* The I-cache stress probes run stale code on purpose and
+                 * can crash the console: only with MARBLE_BENCH_STRESS.
+                 */
+#ifdef MARBLE_BENCH_STRESS
                 if (++frames > 90 && frames % 20 == 0 && frames < 90 + 20 * 13)
                         jit_probe_step(pd);
+#else
+                (void)frames;
+                (void)jit_probe_step;
+#endif
         }
 #endif
 
@@ -637,16 +679,28 @@ static int update(void *ud)
                 angle = CURSOR_ARROW_ANGLE;
         }
 
+#ifdef MARBLE_TIMING
+        cur = pushed = 0;
+        vx = vy = 0;
+        mx = MAC_W / 2;
+        my = MAC_H / 2;
+#endif
         bungee_input(cur, pushed, panel_open, dt, mx, my, mac_ready);
         if (mac_ready) {
+#ifndef MARBLE_TIMING
                 step_marble(dt);
+#endif
                 mac_set_mouse((int)mx, (int)my);
         }
         umac_mouse(0, 0, (cur & kButtonA) ? 1 : 0);
         clickfx_step(cur & kButtonA, vx, vy, dt);
         FP_MARK(0);
 
+#ifdef MARBLE_TIMING
+        timing_run();
+#else
         emu_run(dt_ms);
+#endif
         FP_MARK(1);
 
         step_camera(dt);
@@ -795,6 +849,7 @@ static void init(void)
                 for (unsigned k = 0; k < sizeof tests / sizeof *tests; k++) {
                         for (int i = 0; i < tests[k].n; i++)
                                 RAM_WR16(0x10000 + i * 2, tests[k].code[i]);
+                        m68k_jit_note_write(0x10000, tests[k].n * 2);   /* drop old translations */
                         overlay = 0;
                         m68k_set_reg(16, 0x10000);
                         m68k_set_reg(9, tests[k].a1);   /* A1 */
@@ -808,6 +863,32 @@ static void init(void)
                         pd->system->logToConsole("bench: jit %s: %.0f ns/instr (%lu instrs, %lu interp)",
                                                  tests[k].name, (double)((t1 - t0) * 1e9f / n), n,
                                                  (unsigned long)m68k_jit_stats.interp_instrs);
+                }
+                /* Code footprint: one long straight loop of k register ops,
+                 * so the generated code grows past the I-cache.
+                 */
+                static const int reps[] = { 16, 64, 128, 256, 512 };   /* (bigger trips the 10s watchdog) */
+                for (unsigned k = 0; k < sizeof reps / sizeof *reps; k++) {
+                        static const uint16_t body[4] = { 0xD481, 0xD682, 0xB781, 0x5281 };
+                        uint32_t a = 0x10000;
+                        for (int i = 0; i < reps[k]; i++)
+                                for (int j = 0; j < 4; j++, a += 2)
+                                        RAM_WR16(a, body[j]);
+                        RAM_WR16(a, 0x6000);                    /* bra.w 0x10000 */
+                        RAM_WR16(a + 2, (uint16_t)(0x10000 - (a + 2)));
+                        m68k_jit_note_write(0x10000, a + 4 - 0x10000);
+                        overlay = 0;
+                        m68k_set_reg(16, 0x10000);
+                        uint64_t bytes0 = m68k_jit_stats.code_bytes;
+                        m68k_jit_execute(8 * (reps[k] * 4 * 3 + 1000));  /* warm up: translate */
+                        uint64_t bytes = m68k_jit_stats.code_bytes - bytes0;
+                        m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = 0;
+                        float t0 = pd->system->getElapsedTime();
+                        m68k_jit_execute(8 * 400000);
+                        float t1 = pd->system->getElapsedTime();
+                        unsigned long n = (unsigned long)(m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs);
+                        pd->system->logToConsole("bench: jit footprint %d instrs, %lu code bytes: %.0f ns/instr",
+                                                 reps[k] * 4 + 1, (unsigned long)bytes, (double)((t1 - t0) * 1e9f / n));
                 }
                 memset(mac_ram, 0, RAM_SIZE);
                 mac_ram[0x2af] = 0x40;
