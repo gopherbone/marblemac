@@ -1262,10 +1262,24 @@ static void emit_index(tctx_t *t, int rd, uint32_t ext)
         ea_add(t, rd, (int8_t)(ext & 0xff));
 }
 
+static void emit_ea_addr_in(tctx_t *t, int mode, int reg, int size, int rd);
+
 /* Compute the address of a memory operand into rd (not r1-r3).
- * Applies (An)+ / -(An) register updates.
+ * Applies (An)+ / -(An) register updates.  For a high register, the
+ * address-register modes work in r0 (16-bit forms) and copy the result:
+ * that clobbers r0, which then holds the address too.
  */
 static void emit_ea_addr(tctx_t *t, int mode, int reg, int size, int rd)
+{
+        if (rd >= 8 && mode != EA_7) {
+                emit_ea_addr_in(t, mode, reg, size, R0);
+                t_mov(E, rd, R0);
+        } else {
+                emit_ea_addr_in(t, mode, reg, size, rd);
+        }
+}
+
+static void emit_ea_addr_in(tctx_t *t, int mode, int reg, int size, int rd)
 {
         int step = (size == 1 && reg == 7) ? 2 : size;
         switch (mode) {
@@ -1352,6 +1366,8 @@ static void emit_ea_read(tctx_t *t, int mode, int reg, int size, int addr_reg)
         }
         int ra = addr_reg >= 0 ? addr_reg : R0;  /* (r0: short encodings, no copy) */
         emit_ea_addr(t, mode, reg, size, ra);
+        if (mode != EA_7)
+                ra = R0;                /* (emit_ea_addr left it in r0 too) */
         emit_load(t, size, ra);
 }
 
@@ -1511,16 +1527,16 @@ static void emit_exit_reg(tctx_t *t, int rpc, int ninstr)
         t->f = saved;
 }
 
-/* Push the long in rv onto the 68k stack (uses r11) */
+/* Push the long in rv (not r0; r1 saves a copy) onto the 68k stack */
 static void emit_push32(tctx_t *t, int rv, int last_action)
 {
-        t_ldr(E, R11, R4, OFF_A(7));
-        t_subi(E, R11, R11, 4);
-        t_str(E, R11, R4, OFF_A(7));
+        t_ldr(E, R0, R4, OFF_A(7));
+        ea_add(t, R0, -4);
+        t_str(E, R0, R4, OFF_A(7));
         if (last_action)
-                emit_store(t, 4, R11, rv);
+                emit_store(t, 4, R0, rv);
         else
-                emit_store_nochk(t, 4, R11, rv);
+                emit_store_nochk(t, 4, R0, rv);
 }
 
 /* -------------------------------------------------------------------- */
@@ -1710,9 +1726,9 @@ static int tr_cmpm(tctx_t *t, uint32_t op)
 {
         int size = SIZE_BWL(op >> 6 & 3);
         int ax = op >> 9 & 7, ay = op & 7;
-        emit_ea_read(t, EA_PI, ay, size, R10);
+        emit_ea_read(t, EA_PI, ay, size, -1);
         t_mov(E, R8, R0);
-        emit_ea_read(t, EA_PI, ax, size, R10);
+        emit_ea_read(t, EA_PI, ax, size, -1);
         emit_alu(t, OP_CMP, size);
         emit_flags(t, F_SUB, 0);
         return 0;
@@ -1778,10 +1794,10 @@ static int tr_unary(tctx_t *t, uint32_t op, int kind)
                         t_mov32(E, R0, 0);
                         emit_write_dreg(t, r, size, R0);
                 } else {
-                        emit_ea_addr(t, mode, r, size, R10);
+                        emit_ea_addr(t, mode, r, size, R0);
                         emit_flags_const(t, 0, 1, 0, 0);
-                        t_mov32(E, R8, 0);
-                        emit_store(t, size, R10, R8);
+                        t_movs8(E, R1, 0);      /* (APSR is free: the flags are in r9) */
+                        emit_store(t, size, R0, R1);
                 }
                 return 0;
         }
@@ -1823,8 +1839,8 @@ static int tr_lea(tctx_t *t, uint32_t op)
         int mode = op >> 3 & 7, r = op & 7;
         if (!ea_ok(mode, r, V_CTRL))
                 return -1;
-        emit_ea_addr(t, mode, r, 4, R10);
-        t_str(E, R10, R4, OFF_A(op >> 9 & 7));
+        emit_ea_addr(t, mode, r, 4, R0);
+        t_str(E, R0, R4, OFF_A(op >> 9 & 7));
         return 0;
 }
 
@@ -1833,8 +1849,9 @@ static int tr_pea(tctx_t *t, uint32_t op)
         int mode = op >> 3 & 7, r = op & 7;
         if (!ea_ok(mode, r, V_CTRL))
                 return -1;
-        emit_ea_addr(t, mode, r, 4, R10);
-        emit_push32(t, R10, 1);
+        emit_ea_addr(t, mode, r, 4, R0);
+        t_mov(E, R1, R0);
+        emit_push32(t, R1, 1);
         return 0;
 }
 
@@ -1877,8 +1894,7 @@ static int tr_movem(tctx_t *t, uint32_t op)
                         spec |= MV_AUTO;
                         t_ldr(E, R0, R4, OFF_A(r));
                 } else {
-                        emit_ea_addr(t, mode, r, lng ? 4 : 2, R10);
-                        t_mov(E, R0, R10);
+                        emit_ea_addr(t, mode, r, lng ? 4 : 2, R0);
                 }
         } else {
                 if (!ea_ok(mode, r, (V_CTRL & ~(V_PCDI | V_PCIX)) | V_PD))
@@ -1887,8 +1903,7 @@ static int tr_movem(tctx_t *t, uint32_t op)
                         spec |= MV_AUTO;
                         t_ldr(E, R0, R4, OFF_A(r));
                 } else {
-                        emit_ea_addr(t, mode, r, lng ? 4 : 2, R10);
-                        t_mov(E, R0, R10);
+                        emit_ea_addr(t, mode, r, lng ? 4 : 2, R0);
                 }
         }
         t_mov32(E, R1, spec);
@@ -1900,14 +1915,14 @@ static int tr_link(tctx_t *t, uint32_t op)
 {
         int r = op & 7;
         int16_t d = fetch16(t);
-        t_ldr(E, R11, R4, OFF_A(7));
-        t_subi(E, R11, R11, 4);
-        t_str(E, R11, R4, OFF_A(7));
+        t_ldr(E, R0, R4, OFF_A(7));
+        ea_add(t, R0, -4);
+        t_str(E, R0, R4, OFF_A(7));
         if (r == 7)
-                t_mov(E, R8, R11);              /* LINK A7 pushes the new SP */
+                t_mov(E, R1, R0);               /* LINK A7 pushes the new SP */
         else
-                t_ldr(E, R8, R4, OFF_A(r));
-        emit_store_nochk(t, 4, R11, R8);
+                t_ldr(E, R1, R4, OFF_A(r));
+        emit_store_nochk(t, 4, R0, R1);
         t_ldr(E, R0, R4, OFF_A(7));
         if (r != 7)
                 t_str(E, R0, R4, OFF_A(r));
@@ -2142,8 +2157,8 @@ static int tr_bcc(tctx_t *t, uint32_t op)
         int n = t->count + 1;
 
         if (cc == 1) {                          /* BSR */
-                t_mov32(E, R8, next);
-                emit_push32(t, R8, 0);
+                t_mov32(E, R1, next);
+                emit_push32(t, R1, 0);
                 if (can_follow(t, target)) {
                         t->follow = target;
                         return 2;
@@ -2222,8 +2237,8 @@ static int tr_jmp_jsr(tctx_t *t, uint32_t op)
                 if (t->fail)
                         return -1;
                 if (jsr) {
-                        t_mov32(E, R8, t->fetch);
-                        emit_push32(t, R8, 0);
+                        t_mov32(E, R1, t->fetch);
+                        emit_push32(t, R1, 0);
                 }
                 if (can_follow(t, target)) {
                         t->follow = target;
@@ -2234,8 +2249,8 @@ static int tr_jmp_jsr(tctx_t *t, uint32_t op)
         }
         emit_ea_addr(t, mode, r, 4, R10);
         if (jsr) {
-                t_mov32(E, R8, t->fetch);
-                emit_push32(t, R8, 0);
+                t_mov32(E, R1, t->fetch);
+                emit_push32(t, R1, 0);
         }
         emit_exit_reg(t, R10, t->count + 1);
         return 1;
