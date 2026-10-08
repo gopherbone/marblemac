@@ -3103,23 +3103,32 @@ static void interp_one(void)
  * follows a lot of new code, throw the translations away once.
  */
 #define RELAYOUT_WINDOW 1000000         /* 68k instructions per check (~1s) */
-#define RELAYOUT_QUIET  4               /* at most this many translations in it */
+#define RELAYOUT_QUIET  4               /* at most this many translations in one */
+#define RELAYOUT_STREAK 3               /* ... for this many windows in a row */
+#define RELAYOUT_GAP    30              /* windows between start-overs, at least */
 #define RELAYOUT_BYTES  (256 * 1024)    /* code generated since the last start-over */
 int m68k_jit_relayout = 1;             /* 0: off; n: after n * RELAYOUT_BYTES of new code */
 
+/* (On the device a translation costs far more than the cache model
+ * says: each new block's lines get evicted with the NOP sled.  So this
+ * waits for a settled machine and doesn't happen often.)
+ */
 static void maybe_relayout(void)
 {
         static uint64_t win_instrs;
-        static uint32_t win_xlat;
+        static uint32_t win_xlat, streak, since = RELAYOUT_GAP;
         uint64_t done = m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs;
         if (done - win_instrs < RELAYOUT_WINDOW)
                 return;
-        int quiet = m68k_jit_stats.translations - win_xlat <= RELAYOUT_QUIET;
+        streak = m68k_jit_stats.translations - win_xlat <= RELAYOUT_QUIET ? streak + 1 : 0;
+        since++;
         win_instrs = done;
         win_xlat = m68k_jit_stats.translations;
-        if (m68k_jit_relayout && quiet && (uint32_t)((char *)code_ptr - (char *)perm_end) >= (uint32_t)m68k_jit_relayout * RELAYOUT_BYTES) {
+        if (m68k_jit_relayout && streak >= RELAYOUT_STREAK && since >= RELAYOUT_GAP &&
+            (uint32_t)((char *)code_ptr - (char *)perm_end) >= (uint32_t)m68k_jit_relayout * RELAYOUT_BYTES) {
                 recycle_code();
                 m68k_jit_stats.relayouts++;
+                since = 0;
         }
 }
 
