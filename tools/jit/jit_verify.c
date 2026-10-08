@@ -951,12 +951,12 @@ static void report(const char *when)
         m68kjit_stats_t *s = &m68k_jit_stats;
         double tot = (double)(s->jit_instrs + s->interp_instrs);
         fprintf(stderr, "[%s] t=%.1fs  jit %llu (%.1f%%)  interp %llu  blocks %llu  avg %.1f/blk  "
-                "translations %u (conflict %u stale %u recycles %u, %.0f B/blk, chains %u)  natives %u  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
+                "translations %u (conflict %u stale %u recycles %u, %.0f B/blk, chains %u)  natives %u (%llu instrs)  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
                 when, t_us / 1e6, (unsigned long long)s->jit_instrs, tot ? 100.0 * s->jit_instrs / tot : 0,
                 (unsigned long long)s->interp_instrs, (unsigned long long)s->blocks,
                 s->blocks ? (double)s->jit_instrs / s->blocks : 0,
                 s->translations, s->conflicts, s->stale, s->recycles,
-                s->translations ? (double)s->code_bytes / s->translations : 0, s->chains, s->native_calls, s->flushes, (unsigned long long)verified,
+                s->translations ? (double)s->code_bytes / s->translations : 0, s->chains, s->native_calls, (unsigned long long)s->native_instrs, s->flushes, (unsigned long long)verified,
                 (unsigned long long)unverified, (unsigned long long)mismatches);
 }
 

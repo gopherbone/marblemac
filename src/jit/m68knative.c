@@ -128,9 +128,73 @@ static uint32_t find_type(jregs_t *j, uint32_t pc, uint32_t *ninstr)
         return rts(j);
 }
 
+/* SystemTask: walk the unit table for drivers that are open, not busy
+ * and want periodic time.  Skips entries that don't qualify; at one that
+ * does, stops just after its test (415dc2), leaving the ROM to run it.
+ * Otherwise carries on after the loop (415de2).
+ *
+ *  415dac  move.l  (A3)+, D0
+ *  415dae  beq     $415dde
+ *  415db0  movea.l D0, A0
+ *  415db2  movea.l (A0), A1
+ *  415db4  move.w  ($4,A1), D0
+ *  415db8  andi.w  #$20a0, D0
+ *  415dbc  cmpi.w  #$2020, D0
+ *  415dc0  bne     $415dde
+ *  415dc2  ...                      (driver wants time)
+ *  415dde  subq.w  #1, D3
+ *  415de0  bgt     $415dac
+ *  415de2  ...
+ */
+static uint32_t unit_scan(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        uint32_t a3 = A(3), d3 = D(3) & 0xffff, n = 0;
+        for (;;) {
+                uint32_t d0 = rd32(a3);
+                a3 += 4;
+                D(0) = d0;
+                n += 2;                         /* move.l, beq */
+                if (d0) {
+                        uint32_t a1 = rd32(d0);
+                        uint32_t fl = rd16(a1 + 4) & 0x20a0;
+                        A(0) = d0;
+                        A(1) = a1;
+                        set_w(&D(0), fl);
+                        n += 6;                 /* movea x2, move.w, andi, cmpi, bne */
+                        if (fl == 0x2020) {
+                                /* cmpi's flags: equal */
+                                j->n = 0;
+                                j->not_z = 0;
+                                j->v = 0;
+                                j->c = 0;
+                                A(3) = a3;
+                                set_w(&D(3), d3);
+                                *ninstr = n;
+                                return (pc & 0xff000000) | 0x415dc2;
+                        }
+                }
+                /* subq.w #1, D3 (sets X too); bgt */
+                uint32_t res = d3 - 1;
+                j->x = j->c = (res >> 8) & 0x100;
+                j->n = (res >> 8) & 0xff;
+                j->not_z = res & 0xffff;
+                j->v = ((1 ^ d3) & (res ^ d3)) >> 8 & 0x80;
+                d3 = res & 0xffff;
+                n += 2;
+                int z = d3 == 0, neg = (d3 & 0x8000) != 0, v = j->v != 0;
+                if (z || neg != v)
+                        break;
+        }
+        A(3) = a3;
+        set_w(&D(3), d3);
+        *ninstr = n;
+        return (pc & 0xff000000) | 0x415de2;
+}
+
 const m68k_native_t m68k_natives[] = {
         { 0x413f10, find_ref_id, "find resource ID" },
         { 0x413f1e, find_type, "find resource type" },
+        { 0x415dac, unit_scan, "SystemTask driver scan" },
 };
 const int m68k_native_count = sizeof m68k_natives / sizeof m68k_natives[0];
 

@@ -462,6 +462,7 @@ static uint32_t h_native(uint32_t idx, uint32_t pc)
         uint32_t next = m68k_natives[idx].fn(J, pc, &n);
         J->native_n = n;
         m68k_jit_stats.native_calls++;
+        m68k_jit_stats.native_instrs += n;
         return next;
 }
 
