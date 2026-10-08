@@ -133,9 +133,24 @@ static uint8_t *load_file(const char *name, unsigned int *size_out, int *from_da
  * sectors; the Mac's writes go to a vdisk overlay that we save to the
  * Data folder when the console locks or the game quits.
  */
+/* Disk read stats, for the 5s log line */
+static unsigned disk_reads, disk_read_kb;
+static float disk_read_s;
+static int disk_base_read_file(uint8_t *buf, uint32_t offset, uint32_t len);
+
 static int disk_base_read(void *ctx, uint8_t *buf, uint32_t offset, uint32_t len)
 {
         (void)ctx;
+        float t0 = pd->system->getElapsedTime();
+        disk_reads++;
+        disk_read_kb += len / 1024;
+        int r = disk_base_read_file(buf, offset, len);
+        disk_read_s += pd->system->getElapsedTime() - t0;
+        return r;
+}
+
+static int disk_base_read_file(uint8_t *buf, uint32_t offset, uint32_t len)
+{
         if (pd->file->seek(disk_file, offset, SEEK_SET) < 0)
                 return -1;
         uint32_t got = 0;
@@ -479,8 +494,9 @@ static void timing_input(void)
                         break;
                 x = timing_script[i].x;
                 y = timing_script[i].y;
-                unsigned t = ms - timing_script[i].ms;  /* down 75, up 75, down 75 */
-                button = t < 75 || (t >= 150 && t < 225);
+                /* there for 500ms first, then down 75, up 75, down 75 */
+                unsigned t = ms - timing_script[i].ms;
+                button = (t >= 500 && t < 575) || (t >= 650 && t < 725);
         }
         if (mac_ready)
                 mac_set_mouse(x, y);
@@ -498,9 +514,11 @@ static void timing_run(void)
                 emu_quantum();
                 spent += pd->system->getElapsedTime() - t0;
                 if (emu_us >= next_mark) {
-                        pd->system->logToConsole("timing: emulated %2us-%2us took %.0f ms",
+                        pd->system->logToConsole("timing: emulated %2us-%2us took %.0f ms (disk: %u reads, %u KB, %.0f ms)",
                                                  (unsigned)(next_mark / 1000000 - 5), (unsigned)(next_mark / 1000000),
-                                                 (double)(spent * 1000));
+                                                 (double)(spent * 1000), disk_reads, disk_read_kb, (double)(disk_read_s * 1000));
+                        disk_reads = disk_read_kb = 0;
+                        disk_read_s = 0;
                         spent = 0;
                         next_mark += 5000000;
                 }
@@ -613,8 +631,11 @@ static void draw_stats(unsigned int now)
                 /* One short line every 5s: serial output is slow on the device */
                 static int every;
                 if (++every % 5 == 0) {
-                        pd->system->logToConsole("marblemac: 68k %.0f%% %.0ffps booted=%d",
-                                                 (double)stat_speed, (double)stat_fps, mac_ready);
+                        pd->system->logToConsole("marblemac: 68k %.0f%% %.0ffps booted=%d disk %u reads %u KB %.0f ms",
+                                                 (double)stat_speed, (double)stat_fps, mac_ready,
+                                                 disk_reads, disk_read_kb, (double)(disk_read_s * 1000));
+                        disk_reads = disk_read_kb = 0;
+                        disk_read_s = 0;
 #if defined(UMAC_JIT) && defined(MARBLE_PROFILE)
                         m68kjit_stats_t *js = &m68k_jit_stats;
                         pd->system->logToConsole("marblemac: natives %lu calls %lu instrs (%.0fms), aline %.0fms, idle quanta %lu",

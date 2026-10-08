@@ -809,6 +809,64 @@ static uint32_t ref_max_below(jregs_t *j, uint32_t pc, uint32_t *ninstr)
         }
 }
 
+/* The same scan, counting only references with attribute bit D1 set
+ * (UpdateResFile's compaction runs this a lot: 17% of the instructions
+ * when the Control Panel opens).
+ *
+ *  4138a6  btst    D1, ($4,A2)
+ *  4138aa  beq     $4138c0
+ *  4138ac  move.l  ($4,A2), D0
+ *  4138b0  and.l   $31a.w, D0
+ *  4138b4  cmp.l   D0, D2
+ *  4138b6  bge     $4138c0
+ *  4138b8  cmp.l   D0, D7
+ *  4138ba  ble     $4138c0
+ *  4138bc  move.l  D0, D7
+ *  4138be  move.l  A2, D6
+ *  4138c0  adda.w  #$c, A2
+ *  4138c4  dbra    D4, $4138a6
+ *  4138c8  bra     $4138e6
+ */
+static uint32_t ref_max_below_attr(jregs_t *j, uint32_t pc, uint32_t *ninstr)
+{
+        (void)pc;
+        uint32_t mask = rd32(0x31a), n = 0, d4 = D(4) & 0xffff, bit = D(1) & 7;
+        for (;;) {
+                int set = rd8(A(2) + 4) >> bit & 1;
+                j->not_z = set;                 /* btst: Z only */
+                n += 2;
+                if (set) {
+                        uint32_t d0 = rd32(A(2) + 4) & mask;
+                        D(0) = d0;
+                        flags_cmp(j, D(2), d0, 4);
+                        n += 4;
+                        if ((int32_t)D(2) < (int32_t)d0) {
+                                flags_cmp(j, D(7), d0, 4);
+                                n += 2;
+                                if ((int32_t)D(7) > (int32_t)d0) {
+                                        D(7) = d0;
+                                        D(6) = A(2);
+                                        flags_logic(j, D(6), 4);
+                                        n += 2;
+                                }
+                        }
+                }
+                A(2) += 0xc;
+                n += 2;
+                d4 = (d4 - 1) & 0xffff;
+                if (d4 == 0xffff) {
+                        set_w(&D(4), d4);
+                        *ninstr = n + 1;        /* bra */
+                        return 0x4138e6;
+                }
+                if (n >= LOOP_CAP) {
+                        set_w(&D(4), d4);
+                        *ninstr = n;
+                        return 0x4138a6;
+                }
+        }
+}
+
 /* Resource Manager: find handle A1 among all the references of a map
  * (type entries at A0, refs at A2): what AddResource and friends use to
  * check a handle isn't a resource already.
@@ -2511,6 +2569,7 @@ const m68k_native_t m68k_natives[] = {
         { 0x401e0a, set_cursor, "SetCursor" },
         { 0x40a110, sect_rects, "rect intersection" },
         { 0x4138ca, ref_max_below, "ref scan (max below)" },
+        { 0x4138a6, ref_max_below_attr, "ref scan (max below, attr)" },
         { 0x41405e, ref_find_handle, "ref scan (handle)" },
         { 0x4106c2, heap_find_free, "heap free-block search" },
         { 0x411d72, front_window, "FrontWindow" },
