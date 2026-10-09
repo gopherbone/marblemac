@@ -95,7 +95,9 @@ static int show_stats;
 static float stat_speed, stat_fps;
 static uint64_t stat_emu0;
 static unsigned int stat_ms0, stat_frames;
+#ifdef MARBLE_PROFILE
 static unsigned int prof_ms0;
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 // Files
@@ -747,7 +749,7 @@ static void draw_stats(unsigned int now)
         if (!show_stats)
                 return;
         char buf[48];
-        int n = snprintf(buf, sizeof buf, "68k %3.0f%%  %2.0ffps", stat_speed, stat_fps);
+        int n = snprintf(buf, sizeof buf, "68k %3.0f%%  %2.0ffps", (double)stat_speed, (double)stat_fps);
         if (ui_font)
                 pd->graphics->setFont(ui_font);
         pd->graphics->fillRect(0, LCD_ROWS - 18, 150, 18, kColorWhite);
