@@ -33,7 +33,6 @@ static const tuning_t defaults = {
         .lander_turn    = 270.0f,
         .lander_drag    = 0.15f,
         .lander_ground  = 300.0f,
-        .snag_time      = 0.3f,
 };
 
 tuning_t tune;
@@ -72,7 +71,6 @@ static const param_t params[] = {
         { "sfx_volume",    "Wall/engine volume", P(sfx_volume), 0, 1,     0.05f, 0, "%.2f", ML },
         { "dust",          "Wall dust",      P(dust),          0,    3,     0.1f,  0, "%.1f", ML },
         { "click_volume",  "Click sound volume", P(click_volume), 0, 1,  0.05f, 0, "%.2f", ML },
-        { "snag_time",     "Click snag (s)", P(snag_time),     0,    1.5f,  0.05f, 0, "%.2f", ML },
         { "rope_k",        "Bungee stiffness", P(rope_k),      5,    600,   1.15f, 1, "%.0f", ML },
         { "rope_damp",     "Bungee damping", P(rope_damp),     0,    40,    0.5f,  0, "%.1f", ML },
         { "swing_damp",    "Bungee swing damping", P(swing_damp), 0, 30,  0.5f,  0, "%.1f", M },

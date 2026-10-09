@@ -29,7 +29,6 @@ typedef struct {
         float lander_turn;      /* d-pad rotation, deg/s */
         float lander_drag;      /* 1/s */
         float lander_ground;    /* friction sliding on the floor, px/s^2 */
-        float snag_time;        /* a click pins the pointer's tip this long, s */
 } tuning_t;
 
 #define MODE_MARBLE     0
