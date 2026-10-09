@@ -406,13 +406,21 @@ static void step_lander(float dt, PDButtons cur, int panel_open)
                 .max_speed = tune.max_speed,
                 .wall_bounce = tune.wall_bounce,
         };
-        /* While Down is held the d-pad works the bungee's reel */
+        /* While Down is held the crank works the bungee's reel, and those
+         * turns don't steer: they go into an offset, so the nose stays put
+         * when Down is let go.
+         */
         int roping = (cur & kButtonDown) != 0;
         int controls = !panel_open && !roping;
+        static float crank_last, crank_offset;
+        float crank = pd->system->getCrankAngle();
+        if (roping)
+                crank_offset += remainderf(crank - crank_last, 360);
+        crank_last = crank;
         lander_steer_t st = {
                 .steer = !panel_open,
                 .docked = pd->system->isCrankDocked(),
-                .crank_deg = pd->system->getCrankAngle(),
+                .crank_deg = crank - crank_offset,
                 .rot = controls ? ((cur & kButtonRight) != 0) - ((cur & kButtonLeft) != 0) : 0,
         };
         angle = lander_steer(angle, &st, &p, dt);

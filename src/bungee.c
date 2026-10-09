@@ -65,9 +65,10 @@ static int down_was, down_used;
 
 /* Lander mode: Up thrusts and the crank (or Left/Right) steers, so the
  * rope lives on Down.  Down drops the anchor at once; anchored, a tap of
- * Down lets go, and holding Down makes Up reel in and Right pay out.
+ * Down lets go, and holding Down makes the crank reel (forward reels in,
+ * like a fishing reel).
  */
-static void lander_input(PDButtons cur, PDButtons pushed, float dt, float px, float py)
+static void lander_input(PDButtons cur, PDButtons pushed, float crank, float px, float py)
 {
         int down = (cur & kButtonDown) != 0;
         if (pushed & kButtonDown) {
@@ -82,13 +83,9 @@ static void lander_input(PDButtons cur, PDButtons pushed, float dt, float px, fl
                 }
         }
         float dl = 0;
-        if (down && active) {
-                if (cur & kButtonUp)
-                        dl -= REEL_RATE * dt;
-                if (cur & kButtonRight)
-                        dl += REEL_RATE * dt;
-                if (cur & (kButtonUp | kButtonRight))
-                        down_used = 1;
+        if (down && active && crank != 0) {
+                dl = -crank * REEL_PER_DEG;
+                down_used = 1;
         }
         if (!down && down_was && !down_used)
                 active = 0;
@@ -111,7 +108,7 @@ void bungee_input(PDButtons cur, PDButtons pushed, int panel_open, float dt,
                 return;
         }
         if (lander) {
-                lander_input(cur, pushed, dt, px, py);
+                lander_input(cur, pushed, crank, px, py);
                 return;
         }
         down_was = 0;
