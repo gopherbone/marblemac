@@ -52,6 +52,7 @@ set(SOURCES
 	src/lander.c
 	src/jit/m68kjit.c
 	src/jit/m68knative.c
+	src/jit/m68kinterp.c
 	src/jit_playdate.c
 	${UMAC}/src/main.c
 	${UMAC}/src/disc.c
@@ -84,6 +85,10 @@ target_compile_definitions(${TARGET} PRIVATE
 )
 if (TOOLCHAIN STREQUAL "armgcc")
 	# 68k -> Thumb-2 JIT (device only: the simulator isn't ARM M-profile)
+	# Tiering between the interpreter (src/jit/m68kinterp.c) and the JIT,
+	# via CMAKE_C_FLAGS: -DJIT_TIER=0 (interpret only), 1 (always JIT, as
+	# before), 2 (JIT hot loops) or 3 (JIT hot code, the default);
+	# -DJIT_HOT_THRESHOLD=n, -DJIT_EXIT_HEAT=n, -DJIT_HEAT_DECAY=n (see m68kjit.c)
 	option(MARBLE_JIT "Use the 68k JIT on the device" ON)
 	if (MARBLE_JIT)
 		target_compile_definitions(${TARGET} PRIVATE UMAC_JIT=1)

@@ -56,12 +56,18 @@ typedef struct {
         float (*now)(void);
         /* Optional: storage for the register file (default: the stack) */
         jregs_t *(*regs)(void);
+        /* Optional (testing): run the interpreter, i.e. wrap m68k_interp_run() */
+        int (*interp)(jregs_t *regs);
 } m68kjit_platform_t;
 
 typedef struct {
         uint64_t blocks;        /* translated blocks executed */
         uint64_t jit_instrs;    /* 68k instructions executed in translated code */
         uint64_t interp_instrs; /* ... single-stepped by Musashi */
+        uint64_t fast_instrs;   /* ... run by the interpreter (m68kinterp.c), natives included */
+        uint64_t fast_fallbacks;        /* ... of which it handed to Musashi */
+        uint32_t fast_runs;     /* interpreter runs */
+        uint32_t hot_exits;     /* ... that stopped at a hot loop head */
         uint32_t translations;
         uint32_t flushes;       /* code-write invalidations */
         uint32_t recycles;      /* code buffer wrapped */
@@ -109,6 +115,8 @@ jregs_t *m68k_jit_regs(void);
  * that run's budget then includes M68K_JIT_IDLE_DRAIN that wasn't used */
 extern int m68k_jit_idle_request;
 #define M68K_JIT_IDLE_DRAIN     (1 << 24)
+/* Testing: make j the active register file (outside m68k_jit_execute) */
+void    m68k_jit_use_regs(jregs_t *j);
 /* Executes exactly one instruction with Musashi (no interrupt check) */
 void    m68k_step_one(void);
 

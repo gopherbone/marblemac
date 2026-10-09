@@ -4,11 +4,20 @@
  * Unicorn (Cortex-M7).  After each block, its RAM writes are undone, the
  * CPU state restored, and Musashi re-executes the same instructions; the
  * two results (registers, flags, memory) must match.  Musashi's result is
- * kept, so one bad block doesn't derail the rest of the run.
+ * kept, so one bad block doesn't derail the rest of the run.  Interpreter
+ * runs (src/jit/m68kinterp.c, the tiers other than 1) are checked the
+ * same way, run by run.
  *
  * usage: jit_verify rom.bin disk.img outprefix [script...]
  *   script: "m X Y" glide mouse, "c" click, "dc" double-click,
- *           "w MS" wait, "s NAME" snapshot, "t SECS" run for SECS
+ *           "w MS" wait, "s NAME" snapshot, "t SECS" run for SECS,
+ *           "ifuzz N SEED" the interpreter against Musashi on N random
+ *           instructions, "bltfuzz N SEED", "sim NAME" (with SIM=1) ...
+ * environment (some): TIER=0-3 HOT=n EXITHEAT=n HEATDECAY=n (tiering);
+ *   SIMINTERP=dir: run the interpreter's Cortex-M7 build (from
+ *   tools/jit/interp_sim.sh) under Unicorn, so it's verified and goes
+ *   through the SIM=1 cache model too; INTERPPROF=file, HPROF=addr,reg,
+ *   HPROFH=n: profiles of it; OPMIX=1: the instructions run, by opcode.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +30,7 @@
 #include "m68k.h"
 #include "m68kjit.h"
 #include "m68knative.h"
+#include "m68kjit_int.h"
 #include "macglue.h"
 
 /* Musashi internals we compare */
@@ -181,12 +191,36 @@ static void ophist_report(void)
         ophist_reload = ophist_reload_any = ophist_w32 = ophist_w32_odd = ophist_w32_cross = 0;
         memset(ophist, 0, sizeof ophist);
 }
+static uint64_t sim_interp_instrs, sim_interp_imiss;
+static uint32_t *iprof;                 /* INTERPPROF=file: ARM instructions run per interpreter halfword */
+/* HPROF=addr,reg: the interpreter's dispatch (a tbh/tbb) and the register
+ * holding the handler number: ARM instructions per handler
+ */
+static uint32_t hp_addr, hp_reg = 99, hp_cur, hp_only = ~0u;      /* HPROFH=n: INTERPPROF counts handler n only */
+static uint64_t hp_cost[256], hp_n[256];
 static void sim_fetch(uc_engine *u, uint64_t address, uint32_t size, void *ud)
 {
         (void)u; (void)ud;
         sim_arm_instrs++;
         uint32_t a = (uint32_t)address;
-        if (cache_access(&icache, a, 1) == 2) {
+        int in_interp = a >= 0x0d000000u && a < 0x0d100000u;
+        sim_interp_instrs += in_interp;
+        if (in_interp && iprof && (hp_only == ~0u || hp_only == hp_cur))
+                iprof[(a - 0x0d000000u) / 2]++;
+        if (hp_reg < 13) {
+                if (a == hp_addr) {
+                        uint32_t h;
+                        uc_reg_read(u, UC_ARM_REG_R0 + hp_reg, &h);
+                        hp_cur = h & 255;
+                        hp_n[hp_cur]++;
+                }
+                if (in_interp)
+                        hp_cost[hp_cur]++;
+        }
+        int miss = cache_access(&icache, a, 1);
+        if (miss && in_interp)
+                sim_interp_imiss++;
+        if (miss == 2) {
                 /* Random miss: classify by where we jumped to */
                 if (a < T_CODE + 0x4000)
                         imiss_perm++;
@@ -215,8 +249,8 @@ static void sim_data(uc_engine *u, uc_mem_type type, uint64_t address, int size,
 {
         (void)u; (void)size; (void)value; (void)ud;
         uint32_t a = (uint32_t)address;
-        if (a >= T_REGS && a < T_REGS + 0x4000)
-                return;                         /* DTCM on the device */
+        if ((a >= T_REGS && a < T_REGS + 0x4000) || (a >= T_STACK && a < T_STACK + 0x10000))
+                return;                         /* DTCM on the device (the register file, the stack) */
         if (type == UC_MEM_WRITE) {
                 sim_stores++;
                 cache_access(&dcache, a, 0);    /* no write-allocate */
@@ -313,6 +347,22 @@ static void sim_report(const char *when)
                 (unsigned long long)icache.misses, (unsigned long long)icache.seq_misses,
                 (unsigned long long)dcache.misses, (unsigned long long)dcache.seq_misses,
                 (unsigned long long)sim_stores, t * 1000);
+        /* Not modelled: translating (on the device each one also runs the
+         * I-cache eviction sled), and the interpreter's/JIT's C helpers
+         */
+        static uint64_t x0, f0, i0, j0;
+        m68kjit_stats_t *js = &m68k_jit_stats;
+        fprintf(stderr, "    68k instrs: %llu JIT, %llu interpreter; %llu translations\n",
+                (unsigned long long)(js->jit_instrs - j0), (unsigned long long)(js->fast_instrs - f0),
+                (unsigned long long)(js->translations - x0));
+        x0 = js->translations;
+        f0 = js->fast_instrs;
+        j0 = js->jit_instrs;
+        (void)i0;
+        if (sim_interp_instrs)
+                fprintf(stderr, "    interpreter: %.0fM ARM instrs, %llu I-misses (incl. seq)\n", sim_interp_instrs / 1e6,
+                        (unsigned long long)sim_interp_imiss);
+        sim_interp_instrs = sim_interp_imiss = 0;
         fprintf(stderr, "    random I-misses: %llu into shared routines, %llu at jump targets, %llu falling through\n",
                 (unsigned long long)imiss_perm, (unsigned long long)imiss_entry, (unsigned long long)imiss_mid);
         fprintf(stderr, "    jump-target misses: %llu from shared routines (%llu at a line start), %llu short back, %llu short forward, rest far\n",
@@ -353,6 +403,7 @@ static jregs_t *jregs_buf;              /* page-aligned, mapped at T_REGS */
 static jregs_t *plat_regs(void) { return jregs_buf; }
 
 static uint64_t verified, unverified, mismatches;
+static uint64_t interp_runs, interp_run_instrs;
 static int max_report = 20;
 static int io_touched;
 
@@ -579,11 +630,17 @@ extern int (*umac_io_hook)(int write, unsigned int addr, unsigned int value, uns
 static struct { uint8_t write; uint32_t addr; uint8_t val; uint32_t int_level, virq, nmi; } iolog[MAXIO];
 static int nio, ioplay, io_mode;         /* 0 off, 1 record, 2 replay */
 static int io_bad, io_unverifiable;
+static int fuzz_io;                     /* ifuzz: all byte I/O reads 0, writes go nowhere */
 static char io_why[160];
 
 static int io_hook(int write, unsigned int addr, unsigned int value, unsigned int *out)
 {
         addr &= 0xffffff;
+        if (fuzz_io) {
+                if (out)
+                        *out = 0;
+                return write < 2;
+        }
         if (addr == 0xc00069) {                 /* paravirtual disk: too much going on */
                 io_unverifiable = 1;
                 if (io_mode == 2)
@@ -806,6 +863,412 @@ static void disasm_block(uint32_t pc, int n)
         }
 }
 
+/* ---- ifuzz: the interpreter against Musashi, one instruction at a time ----
+ * A random instruction (mostly from the lines the interpreter handles,
+ * plus random extension words) at a scratch address; random registers
+ * (address registers in scratch RAM), flags and mode.  It runs through
+ * the interpreter, then Musashi runs the same number of instructions from
+ * the same state, and registers, flags, pc, mode, stack pointers and every
+ * byte either side wrote must match.  Byte I/O reads 0 and writes go
+ * nowhere, for both.
+ */
+static uint32_t fz_w[4096];
+static int fz_nw;
+static void fuzz_observe(uint32_t addr, uint32_t size)
+{
+        for (uint32_t i = 0; i < size && fz_nw < 4096; i++)
+                fz_w[fz_nw++] = addr + i;
+}
+
+static uint32_t fz_reg(void)
+{
+        static const uint32_t special[] = { 0, 1, 0xffffffff, 0x80000000, 0x7fffffff, 0x8000, 0x7fff,
+                                            0x80, 0x7f, 0xff, 0xffff, 0x10000, 0xffff8000, 0x20, 0x1f, 0x3f };
+        switch (fz_rand() % 4) {
+        case 0: return special[fz_rand() % 16];
+        case 1: return fz_rand() % 64 - 16;
+        case 2: return (uint32_t)(int16_t)fz_rand();
+        }
+        return fz_rand();
+}
+
+static void interp_fuzz(int trials, uint32_t seed)
+{
+        fz_state = seed ? seed : 1;
+        extern void exit_error(char *fmt, ...);
+        m68ki_cpu_core cpu0;
+        memcpy(&cpu0, &m68ki_cpu, sizeof cpu0);
+        uint8_t *orig = malloc(RAM_SIZE);
+        memcpy(orig, ram, RAM_SIZE);
+
+        /* umac's exit_error() (unmapped word reads) longjmps back into
+         * umac_loop the first time and does nothing after that: trip it
+         * here, with Musashi, so random addresses can't escape later.
+         */
+        {
+                static const uint8_t prog[] = { 0x30, 0x39, 0x00, 0x50, 0x00, 0x00, 0x60, 0xfe };
+                memcpy(ram + 0x3f0000, prog, sizeof prog);
+                m68k_jit_note_write(0x3f0000, sizeof prog);
+                m68k_set_reg(M68K_REG_PC, 0x3f0000);
+                m68ki_cpu.int_mask = 0x700;     /* (or a pending interrupt runs instead) */
+                m68ki_cpu.int_level = 0;
+                m68ki_cpu.nmi_pending = 0;
+                m68ki_cpu.stopped = 0;
+                int en = m68k_jit_enabled;
+                m68k_jit_enabled = 0;
+                fuzz_io = 1;
+                umac_loop();
+                m68k_jit_enabled = en;
+                recording_jit = recording_mus = 0;
+                io_mode = 0;
+                memcpy(&m68ki_cpu, &cpu0, sizeof cpu0);
+                memcpy(ram + 0x3f0000, orig + 0x3f0000, sizeof prog);
+        }
+
+        void (*obs)(uint32_t, uint32_t) = m68k_jit_write_observer;
+        m68k_jit_write_observer = fuzz_observe;
+        static uint8_t ires[4096];
+        static uint32_t iw[4096];
+        int bad = 0, nint = 0, nfall = 0;
+        uint64_t fall0 = m68k_jit_stats.fast_fallbacks;
+        const uint32_t SCR = 0x200000;
+        for (int t = 0; t < trials && bad < 20; t++) {
+                /* The instruction: lines 0-E (not A) mostly */
+                uint32_t op = fz_rand() & 0xffff;
+                if (fz_rand() % 8) {
+                        static const uint8_t lines[] = { 0, 1, 2, 3, 4, 4, 4, 5, 6, 7, 8, 9, 0xb, 0xc, 0xd, 0xe, 0xe };
+                        op = (op & 0x0fff) | lines[fz_rand() % sizeof lines] << 12;
+                }
+                uint32_t code = 0x300000 + (fz_rand() % 0x8000) * 2;
+                uint16_t words[6];
+                words[0] = op;
+                for (int i = 1; i < 6; i++) {
+                        uint32_t w = fz_rand() & 0xffff;
+                        if (fz_rand() % 2)
+                                w &= 0xff3f;    /* as an abs.L high half: RAM */
+                        if (fz_rand() % 4 == 0)
+                                w = (w & 0xf0ff) | (fz_rand() % 8) << 8;        /* small index/bit numbers */
+                        words[i] = w;
+                }
+                for (int i = 0; i < 6; i++) {
+                        ram[code + 2 * i] = words[i] >> 8;
+                        ram[code + 2 * i + 1] = words[i];
+                }
+                m68k_jit_note_write(code, 12);
+
+                /* The state */
+                m68ki_cpu_core c;
+                memcpy(&c, &cpu0, sizeof c);
+                jregs_t j;
+                memset(&j, 0, sizeof j);
+                for (int i = 0; i < 8; i++)
+                        j.dar[i] = fz_reg();
+                for (int i = 8; i < 16; i++) {
+                        j.dar[i] = SCR + (fz_rand() % 0x20000) * 2 + (fz_rand() % 16 == 0);
+                        if (fz_rand() % 16 == 0)
+                                j.dar[i] = fz_reg();
+                }
+                j.dar[15] &= ~1u;
+                if (j.dar[15] < 0x1000 || j.dar[15] >= 0x3f0000)
+                        j.dar[15] = SCR + 0x10000;
+                j.x = (fz_rand() & 1) << 8; j.n = (fz_rand() & 1) << 7; j.not_z = fz_rand() & 1;
+                j.v = (fz_rand() & 1) << 7; j.c = (fz_rand() & 1) << 8;
+                j.pc = code;
+                int user = fz_rand() % 10 == 0;
+                c.s_flag = user ? 0 : SFLAG_SET;
+                c.m_flag = 0;
+                c.t1_flag = c.t0_flag = 0;
+                c.int_mask = user ? 0 : 0x700;
+                c.int_level = 0;
+                c.nmi_pending = 0;
+                c.stopped = 0;
+                c.sp[0] = SCR + 0x30000 + (fz_rand() % 0x1000) * 2;     /* USP */
+                c.sp[4] = SCR + 0x38000 + (fz_rand() % 0x1000) * 2;     /* ISP */
+                if (user)
+                        c.sp[0] = j.dar[15];
+                else
+                        c.sp[4] = j.dar[15];
+                for (int i = 0; i < 16; i++)
+                        c.dar[i] = j.dar[i];
+                c.x_flag = j.x; c.n_flag = j.n; c.not_z_flag = j.not_z; c.v_flag = j.v; c.c_flag = j.c;
+                c.pc = code;
+
+                /* Interpreter */
+                memcpy(&m68ki_cpu, &c, sizeof c);
+                fz_nw = 0;
+                fuzz_io = 1;
+                m68k_jit_use_regs(&j);
+                m68k_interp_env_refresh();
+                j.budget = 1;
+                m68k_interp_run(&j);
+                uint32_t n = 1 - j.budget;
+                if (m68k_jit_idle_request) {
+                        m68k_jit_idle_request = 0;
+                        n -= M68K_JIT_IDLE_DRAIN;
+                }
+                int inw = fz_nw;
+                for (int i = 0; i < inw; i++) {
+                        iw[i] = fz_w[i];
+                        ires[i] = ram[fz_w[i] & 0xffffff];
+                }
+                uint32_t i_s = m68ki_cpu.s_flag, i_mask = m68ki_cpu.int_mask, i_usp = m68ki_cpu.sp[0],
+                         i_isp = m68ki_cpu.sp[4], i_stop = m68ki_cpu.stopped;
+                if (m68k_jit_stats.fast_fallbacks != fall0) {
+                        nfall++;
+                        fall0 = m68k_jit_stats.fast_fallbacks;
+                } else {
+                        nint++;
+                }
+                /* undo its writes (from the latest back: the first old value wins) */
+                for (int i = 0; i < inw; i++)
+                        ram[iw[i]] = orig[iw[i]];
+                for (int i = 0; i < 6; i++) {
+                        ram[code + 2 * i] = words[i] >> 8;
+                        ram[code + 2 * i + 1] = words[i];
+                }
+
+                /* Musashi */
+                memcpy(&m68ki_cpu, &c, sizeof c);
+                fz_nw = 0;
+                for (uint32_t i = 0; i < n && n < 1000; i++)
+                        m68k_step_one();
+                fuzz_io = 0;
+
+                int ok = n < 1000;
+                char why[400] = "";
+                int wl = 0;
+                for (int i = 0; i < 16; i++)
+                        if (j.dar[i] != m68ki_cpu.dar[i]) {
+                                ok = 0;
+                                wl += snprintf(why + wl, sizeof why - wl, " %c%d %08x/%08x", i < 8 ? 'D' : 'A', i & 7,
+                                               j.dar[i], m68ki_cpu.dar[i]);
+                        }
+                if (j.pc != m68ki_cpu.pc || jflag_bits(&j) != flag_bits(&m68ki_cpu)) {
+                        ok = 0;
+                        wl += snprintf(why + wl, sizeof why - wl, " PC %06x/%06x XNZVC %02x/%02x", j.pc, m68ki_cpu.pc,
+                                       jflag_bits(&j), flag_bits(&m68ki_cpu));
+                }
+                if (i_s != m68ki_cpu.s_flag || i_mask != m68ki_cpu.int_mask || i_stop != m68ki_cpu.stopped ||
+                    i_usp != m68ki_cpu.sp[0] || i_isp != m68ki_cpu.sp[4]) {
+                        ok = 0;
+                        wl += snprintf(why + wl, sizeof why - wl, " S %x/%x mask %x/%x stop %x/%x usp %x/%x isp %x/%x",
+                                       i_s, m68ki_cpu.s_flag, i_mask, m68ki_cpu.int_mask, i_stop, m68ki_cpu.stopped,
+                                       i_usp, m68ki_cpu.sp[0], i_isp, m68ki_cpu.sp[4]);
+                }
+                /* Memory: every byte either wrote */
+                for (int i = 0; i < inw && ok; i++) {
+                        uint32_t a = iw[i] & 0xffffff;
+                        uint8_t v = ires[i];
+                        for (int k = i + 1; k < inw; k++)
+                                if (iw[k] == iw[i])
+                                        v = ires[k];
+                        if (ram[a] != v) {
+                                ok = 0;
+                                wl += snprintf(why + wl, sizeof why - wl, " mem[%06x] %02x/%02x", a, v, ram[a]);
+                        }
+                }
+                for (int i = 0; i < fz_nw && ok; i++) {
+                        uint32_t a = fz_w[i] & 0xffffff;
+                        int found = 0;
+                        for (int k = 0; k < inw; k++)
+                                found |= iw[k] == fz_w[i];
+                        if (!found && ram[a] != orig[a] && !(a >= code && a < code + 12)) {
+                                ok = 0;
+                                wl += snprintf(why + wl, sizeof why - wl, " mem[%06x] (unwritten) %02x/%02x", a, orig[a], ram[a]);
+                        }
+                }
+                if (!ok) {
+                        bad++;
+                        char buf[100];
+                        m68k_disassemble(buf, code, M68K_CPU_TYPE_68000);
+                        fprintf(stderr, "ifuzz %d: %04x %04x %04x %04x  %-30s n=%u%s%s\n", t, words[0], words[1], words[2],
+                                words[3], buf, n, user ? " (user)" : "", why);
+                        fprintf(stderr, "   before:");
+                        for (int i = 0; i < 16; i++)
+                                fprintf(stderr, " %08x", c.dar[i]);
+                        fprintf(stderr, "\n");
+                }
+                /* restore memory */
+                for (int i = 0; i < fz_nw; i++)
+                        ram[fz_w[i] & 0xffffff] = orig[fz_w[i] & 0xffffff];
+                for (int i = 0; i < inw; i++)
+                        ram[iw[i] & 0xffffff] = orig[iw[i] & 0xffffff];
+                memcpy(ram + code, orig + code, 12);
+                m68k_jit_note_write(code, 12);
+        }
+        m68k_jit_write_observer = obs;
+        memcpy(&m68ki_cpu, &cpu0, sizeof cpu0);
+        if (memcmp(ram, orig, RAM_SIZE))
+                fprintf(stderr, "ifuzz: (RAM not restored!)\n");
+        memcpy(ram, orig, RAM_SIZE);
+        free(orig);
+        fprintf(stderr, "ifuzz: %d trials (%d interpreted, %d to Musashi), %d BAD\n", trials, nint, nfall, bad);
+        mismatches += bad;
+}
+
+/* Undo the run's RAM writes, replay its n instructions with Musashi from
+ * the state before (s0), and compare with the result (j1).  Leaves
+ * Musashi's state and memory.
+ */
+/* OPMIX: the instructions run (as replayed), by opcode */
+static uint32_t *opmix, *opmix_pc;
+static void opmix_report(void)
+{
+        uint64_t tot = 0, byline[16] = { 0 };
+        for (int i = 0; i < 65536; i++) {
+                tot += opmix[i];
+                byline[i >> 12] += opmix[i];
+        }
+        fprintf(stderr, "opcode mix: %llu instrs; by line:", (unsigned long long)tot);
+        for (int i = 0; i < 16; i++)
+                fprintf(stderr, " %X:%.1f%%", i, 100.0 * byline[i] / tot);
+        fprintf(stderr, "\n");
+        double cum = 0;
+        for (int k = 0; k < 80; k++) {
+                int best = 0;
+                for (int i = 1; i < 65536; i++)
+                        if (opmix[i] > opmix[best])
+                                best = i;
+                if (!opmix[best])
+                        break;
+                char buf[100];
+                m68k_disassemble(buf, opmix_pc[best], M68K_CPU_TYPE_68000);
+                cum += 100.0 * opmix[best] / tot;
+                fprintf(stderr, "  %04x %5.2f%% (%5.1f%%)  %s\n", best, 100.0 * opmix[best] / tot, cum, buf);
+                opmix[best] = 0;
+        }
+}
+
+static int check_run(const m68ki_cpu_core *s0, const jregs_t *j1, uint32_t n, const char *kind)
+{
+        if (io_touched || io_unverifiable || njit_w >= 65536) {
+                unverified++;
+                return 0;
+        }
+
+        for (int i = njit_w - 1; i >= 0; i--)
+                ram[jit_w[i].addr] = jit_w[i].old;
+        memcpy(&m68ki_cpu, s0, sizeof *s0);
+
+        int saved_cycles = m68ki_remaining_cycles;
+        nmus_w = 0;
+        recording_mus = 1;
+        io_mode = 2;
+        nmus_pcs = 0;
+        for (uint32_t i = 0; i < n; i++) {
+                if (iexec)
+                        iexec[m68ki_cpu.pc & 0xffffff]++;
+                if (trapprof_on)
+                        trapprof_step();
+                if (nmus_pcs < 8192)
+                        mus_pcs[nmus_pcs++] = m68ki_cpu.pc;
+                m68k_step_one();
+                if (opmix)
+                        opmix[m68ki_cpu.ir & 0xffff]++, opmix_pc[m68ki_cpu.ir & 0xffff] = m68ki_cpu.ppc;
+        }
+        recording_mus = 0;
+        io_mode = 0;
+        m68ki_remaining_cycles = saved_cycles;
+
+        int bad = 0;
+        char why[512] = "";
+        int wl = 0;
+        if (io_bad || ioplay != nio) {
+                bad = 1;
+                wl += snprintf(why + wl, sizeof why - wl, "%s (I/O replayed %d of %d)", io_why, ioplay, nio);
+        }
+        for (int i = 0; i < 16; i++) {
+                if (j1->dar[i] != m68ki_cpu.dar[i]) {
+                        bad = 1;
+                        wl += snprintf(why + wl, sizeof why - wl, " %c%d jit=%08x mus=%08x",
+                                       i < 8 ? 'D' : 'A', i & 7, j1->dar[i], m68ki_cpu.dar[i]);
+                }
+        }
+        if (j1->pc != m68ki_cpu.pc) {
+                bad = 1;
+                wl += snprintf(why + wl, sizeof why - wl, " PC jit=%06x mus=%06x", j1->pc, m68ki_cpu.pc);
+        }
+        if (jflag_bits(j1) != flag_bits(&m68ki_cpu)) {
+                bad = 1;
+                wl += snprintf(why + wl, sizeof why - wl, " XNZVC jit=%02x mus=%02x",
+                               jflag_bits(j1), flag_bits(&m68ki_cpu));
+        }
+        /* Memory: every byte either side wrote must agree */
+        for (int i = 0; i < njit_w && !bad; i++) {
+                uint32_t a = jit_w[i].addr;
+                uint8_t jv = jit_w[i].new_;
+                for (int k = i + 1; k < njit_w; k++)
+                        if (jit_w[k].addr == a)
+                                jv = jit_w[k].new_;
+                if (ram[a] != jv) {
+                        bad = 1;
+                        wl += snprintf(why + wl, sizeof why - wl, " mem[%06x] jit=%02x mus=%02x", a, jv, ram[a]);
+                }
+        }
+        for (int i = 0; i < nmus_w && !bad; i++) {
+                for (int b = 0; b < 4; b++) {
+                        uint32_t a = mus_w[i].addr + b;
+                        if (a >= RAM_SIZE)
+                                continue;
+                        int found = 0;
+                        uint8_t jv = 0;
+                        for (int k = 0; k < njit_w; k++)
+                                if (jit_w[k].addr == a) {
+                                        found = 1;
+                                        jv = jit_w[k].new_;
+                                }
+                        if (!found) {
+                                /* JIT left it alone; it should still hold the old value */
+                                uint8_t old = mus_w[i].old[b];
+                                for (int j = 0; j < i; j++)     /* earliest recorded old */
+                                        if (mus_w[j].addr <= a && a < mus_w[j].addr + 4) {
+                                                old = mus_w[j].old[a - mus_w[j].addr];
+                                                break;
+                                        }
+                                jv = old;
+                        }
+                        if (ram[a] != jv) {
+                                bad = 1;
+                                wl += snprintf(why + wl, sizeof why - wl, " mem[%06x] jit=%02x mus=%02x", a, jv, ram[a]);
+                                break;
+                        }
+                }
+        }
+
+        if (bad) {
+                mismatches++;
+                if (mismatches <= (uint64_t)max_report) {
+                        fprintf(stderr, "MISMATCH %s %06x (%u instrs):%s\n", kind, s0->pc, n, why);
+                        if (n <= 40)
+                                disasm_block(s0->pc, n);
+                        if (getenv("MUSPCS"))   /* the pcs Musashi went through */
+                                for (uint32_t k = 0; k < nmus_pcs; k++)
+                                        fprintf(stderr, "  mus %4u %06x\n", k, mus_pcs[k]);
+                        if (blk_pc) {
+                                /* Walk the JIT's block entries against Musashi's pcs */
+                                uint32_t m = 0;
+                                for (uint32_t k = 0; k < nentered; k++) {
+                                        uint32_t want = entered[k] & 0x3fffffff;
+                                        while (m < nmus_pcs && mus_pcs[m] != want)
+                                                m++;
+                                        if (m >= nmus_pcs) {
+                                                fprintf(stderr, "  JIT entered block %06x (%s) at entry %u; Musashi never went there."
+                                                        " Previous JIT block %06x\n", want,
+                                                        entered[k] & 0x80000000u ? "via push" : "chained/cached", k,
+                                                        k ? entered[k - 1] & 0x3fffffff : 0);
+                                                if (k)
+                                                        disasm_block(entered[k - 1] & 0x3fffffff, 12);
+                                                break;
+                                        }
+                                }
+                        }
+                }
+        } else {
+                verified++;
+        }
+        return 1;
+}
+
 static uint32_t plat_run(void *entry, void *code, jregs_t *regs)
 {
         static m68ki_cpu_core s0;
@@ -858,134 +1321,177 @@ static uint32_t plat_run(void *entry, void *code, jregs_t *regs)
         if (m68k_jit_idle_request)
                 n -= M68K_JIT_IDLE_DRAIN;       /* (the run stopped at an idle GetNextEvent) */
 
-        if (io_touched || io_unverifiable || njit_w >= 65536) {
-                unverified++;
+        if (!check_run(&s0, &j1, n, "block"))
                 return n;
-        }
-
-        for (int i = njit_w - 1; i >= 0; i--)
-                ram[jit_w[i].addr] = jit_w[i].old;
-        memcpy(&m68ki_cpu, &s0, sizeof s0);
-
-        int saved_cycles = m68ki_remaining_cycles;
-        nmus_w = 0;
-        recording_mus = 1;
-        io_mode = 2;
-        nmus_pcs = 0;
-        for (uint32_t i = 0; i < n; i++) {
-                if (iexec)
-                        iexec[m68ki_cpu.pc & 0xffffff]++;
-                if (trapprof_on)
-                        trapprof_step();
-                if (nmus_pcs < 8192)
-                        mus_pcs[nmus_pcs++] = m68ki_cpu.pc;
-                m68k_step_one();
-        }
-        recording_mus = 0;
-        io_mode = 0;
-        m68ki_remaining_cycles = saved_cycles;
-
-        int bad = 0;
-        char why[512] = "";
-        int wl = 0;
-        if (io_bad || ioplay != nio) {
-                bad = 1;
-                wl += snprintf(why + wl, sizeof why - wl, "%s (I/O replayed %d of %d)", io_why, ioplay, nio);
-        }
-        for (int i = 0; i < 16; i++) {
-                if (j1.dar[i] != m68ki_cpu.dar[i]) {
-                        bad = 1;
-                        wl += snprintf(why + wl, sizeof why - wl, " %c%d jit=%08x mus=%08x",
-                                       i < 8 ? 'D' : 'A', i & 7, j1.dar[i], m68ki_cpu.dar[i]);
-                }
-        }
-        if (j1.pc != m68ki_cpu.pc) {
-                bad = 1;
-                wl += snprintf(why + wl, sizeof why - wl, " PC jit=%06x mus=%06x", j1.pc, m68ki_cpu.pc);
-        }
-        if (jflag_bits(&j1) != flag_bits(&m68ki_cpu)) {
-                bad = 1;
-                wl += snprintf(why + wl, sizeof why - wl, " XNZVC jit=%02x mus=%02x",
-                               jflag_bits(&j1), flag_bits(&m68ki_cpu));
-        }
-        /* Memory: every byte either side wrote must agree */
-        for (int i = 0; i < njit_w && !bad; i++) {
-                uint32_t a = jit_w[i].addr;
-                uint8_t jv = jit_w[i].new_;
-                for (int k = i + 1; k < njit_w; k++)
-                        if (jit_w[k].addr == a)
-                                jv = jit_w[k].new_;
-                if (ram[a] != jv) {
-                        bad = 1;
-                        wl += snprintf(why + wl, sizeof why - wl, " mem[%06x] jit=%02x mus=%02x", a, jv, ram[a]);
-                }
-        }
-        for (int i = 0; i < nmus_w && !bad; i++) {
-                for (int b = 0; b < 4; b++) {
-                        uint32_t a = mus_w[i].addr + b;
-                        if (a >= RAM_SIZE)
-                                continue;
-                        int found = 0;
-                        uint8_t jv = 0;
-                        for (int k = 0; k < njit_w; k++)
-                                if (jit_w[k].addr == a) {
-                                        found = 1;
-                                        jv = jit_w[k].new_;
-                                }
-                        if (!found) {
-                                /* JIT left it alone; it should still hold the old value */
-                                uint8_t old = mus_w[i].old[b];
-                                for (int j = 0; j < i; j++)     /* earliest recorded old */
-                                        if (mus_w[j].addr <= a && a < mus_w[j].addr + 4) {
-                                                old = mus_w[j].old[a - mus_w[j].addr];
-                                                break;
-                                        }
-                                jv = old;
-                        }
-                        if (ram[a] != jv) {
-                                bad = 1;
-                                wl += snprintf(why + wl, sizeof why - wl, " mem[%06x] jit=%02x mus=%02x", a, jv, ram[a]);
-                                break;
-                        }
-                }
-        }
-
-        if (bad) {
-                mismatches++;
-                if (mismatches <= (uint64_t)max_report) {
-                        fprintf(stderr, "MISMATCH block %06x (%u instrs):%s\n", s0.pc, n, why);
-                        if (n <= 40)
-                                disasm_block(s0.pc, n);
-                        if (getenv("MUSPCS"))   /* the pcs Musashi went through */
-                                for (uint32_t k = 0; k < nmus_pcs; k++)
-                                        fprintf(stderr, "  mus %4u %06x\n", k, mus_pcs[k]);
-                        if (blk_pc) {
-                                /* Walk the JIT's block entries against Musashi's pcs */
-                                uint32_t m = 0;
-                                for (uint32_t k = 0; k < nentered; k++) {
-                                        uint32_t want = entered[k] & 0x3fffffff;
-                                        while (m < nmus_pcs && mus_pcs[m] != want)
-                                                m++;
-                                        if (m >= nmus_pcs) {
-                                                fprintf(stderr, "  JIT entered block %06x (%s) at entry %u; Musashi never went there."
-                                                        " Previous JIT block %06x\n", want,
-                                                        entered[k] & 0x80000000u ? "via push" : "chained/cached", k,
-                                                        k ? entered[k - 1] & 0x3fffffff : 0);
-                                                if (k)
-                                                        disasm_block(entered[k - 1] & 0x3fffffff, 12);
-                                                break;
-                                        }
-                                }
-                        }
-                }
-        } else {
-                verified++;
-        }
         /* Carry on from Musashi's result, keeping the JIT's bookkeeping */
         m68k_jit_sync_in();
         regs->budget = j1.budget;
         regs->lastexit = j1.lastexit;
         return n;
+}
+
+static uint8_t *slurp(const char *p, size_t *n);
+
+/* ---- SIMINTERP=dir: the interpreter's Cortex-M7 build, under Unicorn ----
+ * (built by tools/jit/interp_sim.sh).  Its calls out land on stubs, which
+ * call the real functions; interpreter runs then get checked like JIT
+ * runs, and with SIM=1 its code and data go through the cache model.
+ */
+#define T_ICODE 0x0d000000u
+#define T_ISTUB 0x0e800000u
+static uint32_t sim_interp_run, sim_interp_env;         /* ARM addresses; 0: host interpreter */
+
+static void hook_istub(uc_engine *u, uint64_t address, uint32_t size, void *ud)
+{
+        (void)size; (void)ud;
+        int n = (int)((address - T_ISTUB) / 4);
+        uint32_t a, b, r = 0;
+        uc_reg_read(u, UC_ARM_REG_R0, &a);
+        uc_reg_read(u, UC_ARM_REG_R1, &b);
+        extern unsigned int cpu_read_byte(unsigned int), cpu_read_word(unsigned int), cpu_read_long(unsigned int);
+        extern void cpu_write_word(unsigned int, unsigned int), cpu_write_long(unsigned int, unsigned int);
+        /* (the order of STUBS in interp_sim.sh) */
+        switch (n) {
+        case 0: r = cpu_read_byte(a); break;
+        case 1: r = cpu_read_word(a); io_touched = 1; break;
+        case 2: r = cpu_read_long(a); io_touched = 1; break;
+        case 3: cpu_write_word(a, b); io_touched = 1; break;
+        case 4: cpu_write_long(a, b); io_touched = 1; break;
+        case 5: r = m68k_jit_check_write(a, b); break;
+        case 6: r = m68k_jit_get_sr(); break;
+        case 7: r = m68k_jit_h_aline(a); break;
+        case 8: r = m68k_jit_h_div0(a); break;
+        case 9: r = m68k_jit_h_fallback(a); break;
+        case 10: m68k_jit_h_movem(a, b); break;
+        case 11: r = m68k_jit_h_native(a, b); break;
+        case 12: r = m68k_jit_h_rte(a); break;
+        case 13: r = m68k_jit_h_srop(a, b); break;
+        case 14: r = m68k_jit_h_super(); break;
+        case 15: r = m68k_jit_h_wr8(a, b); break;
+        case 16: r = m68k_jit_set_sr_then(a, b); break;
+        case 17: r = (uint32_t)m68k_native_lookup(a); break;
+        default:
+                fprintf(stderr, "interp stub %d?\n", n);
+                exit(1);
+        }
+        uc_reg_write(u, UC_ARM_REG_R0, &r);
+}
+
+static void sim_interp_load(const char *dir)
+{
+        char path[512];
+        size_t n;
+        snprintf(path, sizeof path, "%s/interp_sim.bin", dir);
+        uint8_t *img = slurp(path, &n);
+        uc_err err;
+        if ((err = uc_mem_map(uc, T_ICODE, 1u << 20, UC_PROT_ALL)))
+                die("map interp", err);
+        uc_mem_write(uc, T_ICODE, img, n);
+        free(img);
+        snprintf(path, sizeof path, "%s/interp_sim.sym", dir);
+        FILE *f = fopen(path, "r");
+        char name[64];
+        unsigned addr;
+        while (f && fscanf(f, "%63s %x", name, &addr) == 2) {
+                if (!strcmp(name, "m68k_interp_run"))
+                        sim_interp_run = addr;
+                else if (!strcmp(name, "m68k_interp_env"))
+                        sim_interp_env = addr;
+        }
+        if (f)
+                fclose(f);
+        if (!sim_interp_run || !sim_interp_env) {
+                fprintf(stderr, "%s: no symbols\n", path);
+                exit(1);
+        }
+        if ((err = uc_mem_map(uc, T_ISTUB, 0x1000, UC_PROT_ALL)))
+                die("map interp stubs", err);
+        uint16_t bxlr[2 * 64];
+        for (int i = 0; i < 2 * 64; i++)
+                bxlr[i] = 0x4770;
+        uc_mem_write(uc, T_ISTUB, bxlr, sizeof bxlr);
+        static uc_hook h;
+        uc_hook_add(uc, &h, UC_HOOK_CODE, hook_istub, NULL, T_ISTUB, T_ISTUB + 4 * 64 - 1);
+        fprintf(stderr, "interpreter: ARM build from %s (run %08x, %zu bytes)\n", dir, sim_interp_run, n);
+}
+
+static int sim_interp_call(jregs_t *regs)
+{
+        /* Its m68k_interp_env, with target addresses (32-bit layout) */
+        m68k_interp_env_t *e = &m68k_interp_env;
+        uint32_t w[16];
+        w[0] = T_RAM;
+        w[1] = T_ROM;
+        w[2] = plat_taddr(e->codepage);
+        w[3] = plat_taddr(e->heat);
+        w[4] = e->ram_size;
+        w[5] = e->rom_mask;
+        w[6] = (uint32_t)e->tier;
+        w[7] = (uint32_t)e->hot;
+        memcpy(&w[8], e->natbits, 32);
+        uc_mem_write(uc, sim_interp_env, w, sizeof w);
+        uint32_t sp = T_STACK + 0x10000 - 64, lr = T_RET | 1, r0 = plat_taddr(regs);
+        uc_reg_write(uc, UC_ARM_REG_SP, &sp);
+        uc_reg_write(uc, UC_ARM_REG_LR, &lr);
+        uc_reg_write(uc, UC_ARM_REG_R0, &r0);
+        uc_err err = uc_emu_start(uc, sim_interp_run | 1, T_RET, 0, 0);
+        if (err) {
+                uint32_t pc;
+                uc_reg_read(uc, UC_ARM_REG_PC, &pc);
+                fprintf(stderr, "unicorn (interpreter): %s at %08x (68k pc %06x)\n", uc_strerror(err), pc, regs->pc);
+                for (int i = 0; i < 13; i++) {
+                        uint32_t v;
+                        uc_reg_read(uc, UC_ARM_REG_R0 + i, &v);
+                        fprintf(stderr, " r%d=%08x", i, v);
+                }
+                fprintf(stderr, "\n");
+                if (getenv("RING"))
+                        for (int i = 0; i < 64; i++)
+                                fprintf(stderr, " %08x", ring[(ringi + i) & 63]);
+                fprintf(stderr, "\n");
+                exit(1);
+        }
+        uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+        return (int)r0;
+}
+
+/* An interpreter run (m68kinterp.c), checked the same way: its RAM writes
+ * come through the write observer (INTERP_OBSERVE build), I/O is recorded
+ * for Musashi's replay.
+ */
+static int plat_interp(jregs_t *regs)
+{
+        static m68ki_cpu_core s0;
+        static jregs_t j0, j1;
+        m68k_jit_sync_out();
+        memcpy(&s0, &m68ki_cpu, sizeof s0);
+        j0 = *regs;
+        njit_w = 0;
+        io_touched = 0;
+        m68k_interp_slow_io = 0;
+        nentered = 0;
+        nio = ioplay = io_bad = io_unverifiable = 0;
+        io_mode = 1;
+        recording_jit = 1;
+        int why = sim_interp_run ? sim_interp_call(regs) : m68k_interp_run(regs);
+        recording_jit = 0;
+        io_mode = 0;
+        for (int i = 0; i < njit_w; i++)
+                if (jit_w[i].from_helper)
+                        jit_w[i].new_ = ram[jit_w[i].addr];
+        if (m68k_interp_slow_io)
+                io_touched = 1;
+        j1 = *regs;
+        uint32_t n = j0.budget - j1.budget;
+        if (m68k_jit_idle_request)
+                n -= M68K_JIT_IDLE_DRAIN;
+        interp_runs++;
+        interp_run_instrs += n;
+        if (!check_run(&s0, &j1, n, "interp"))
+                return why;
+        m68k_jit_sync_in();
+        regs->budget = j1.budget;
+        return why;
 }
 
 /* Which writes cause flushes: histogram by 64-byte line, with the PC */
@@ -1143,7 +1649,11 @@ static void snapshot(const char *prefix, const char *name)
 static void report(const char *when)
 {
         m68kjit_stats_t *s = &m68k_jit_stats;
-        double tot = (double)(s->jit_instrs + s->interp_instrs);
+        double tot = (double)(s->jit_instrs + s->interp_instrs + s->fast_instrs);
+        fprintf(stderr, "[%s] interpreter %llu (%.1f%%; %llu to Musashi)  runs %u (%.1f/run, %u hot exits; verified runs %llu)\n",
+                when, (unsigned long long)s->fast_instrs, tot ? 100.0 * s->fast_instrs / tot : 0,
+                (unsigned long long)s->fast_fallbacks, s->fast_runs, s->fast_runs ? (double)s->fast_instrs / s->fast_runs : 0,
+                s->hot_exits, (unsigned long long)interp_runs);
         fprintf(stderr, "[%s] t=%.1fs  jit %llu (%.1f%%)  interp %llu  blocks %llu  avg %.1f/blk  "
                 "translations %u (conflict %u stale %u recycles %u relayouts %u, %.0f B/blk, chains %u)  natives %u (%llu instrs)  idle %u  flushes %u  verified %llu  unverified %llu  MISMATCHES %llu\n",
                 when, t_us / 1e6, (unsigned long long)s->jit_instrs, tot ? 100.0 * s->jit_instrs / tot : 0,
@@ -1180,7 +1690,7 @@ int main(int argc, char **argv)
         static const m68kjit_platform_t plat = {
                 .taddr = plat_taddr, .helper_addr = plat_helper_addr, .run = plat_run,
                 .code_written = plat_code_written, .recycle = plat_recycle, .alloc = plat_alloc,
-                .regs = plat_regs,
+                .regs = plat_regs, .interp = plat_interp,
         };
         jregs_buf = aligned(0x1000);
         cpu_page = (uintptr_t)&m68ki_cpu & ~(uintptr_t)0xfff;
@@ -1242,6 +1752,18 @@ int main(int argc, char **argv)
         uc_hook_add(uc, &h1, UC_HOOK_CODE, hook_helper, NULL, T_HELP, T_HELP + 4 * JH_COUNT - 1);
         uc_hook_add(uc, &h2, UC_HOOK_MEM_WRITE, hook_mem_write, NULL, T_RAM, T_RAM + RAM_SIZE - 1);
 
+        if (getenv("SIMINTERP"))
+                sim_interp_load(getenv("SIMINTERP"));
+        if (getenv("OPMIX")) {
+                opmix = calloc(65536, 4);
+                opmix_pc = calloc(65536, 4);
+        }
+        if (getenv("INTERPPROF"))
+                iprof = calloc(0x8000, 4);
+        if (getenv("HPROF"))
+                sscanf(getenv("HPROF"), "%x,%u", &hp_addr, &hp_reg);
+        if (getenv("HPROFH"))
+                hp_only = atoi(getenv("HPROFH"));
         if (getenv("DUMP")) {
                 extern uint16_t *m68k_jit_debug_translate(uint32_t pc, uint32_t *len);
                 uint32_t len, pc = strtoul(getenv("DUMP"), 0, 16);
@@ -1279,6 +1801,14 @@ int main(int argc, char **argv)
         m68k_jit_natives_all = getenv("ALLNATIVES") != NULL;
         extern int m68k_jit_no_traces;
         m68k_jit_no_traces = getenv("NOTRACE") != NULL;
+        if (getenv("TIER"))
+                m68k_jit_tier = atoi(getenv("TIER"));
+        if (getenv("HEATDECAY"))
+                m68k_jit_heat_decay = atoi(getenv("HEATDECAY"));
+        if (getenv("EXITHEAT"))
+                m68k_jit_exit_heat = atoi(getenv("EXITHEAT"));
+        if (getenv("HOT"))
+                m68k_jit_hot_threshold = atoi(getenv("HOT"));
         extern int m68k_jit_max_budget;
         if (getenv("BUDGET"))
                 m68k_jit_max_budget = atoi(getenv("BUDGET"));
@@ -1310,9 +1840,10 @@ int main(int argc, char **argv)
                         m68k_set_reg(M68K_REG_A1, tests[k].a1);
                         m68k_jit_execute(8 * 1000);
                         sim_report("warmup");
-                        m68k_jit_stats.jit_instrs = 0;
+                        m68k_jit_stats.jit_instrs = m68k_jit_stats.fast_instrs = 0;
                         m68k_jit_execute(8 * 400000);
-                        fprintf(stderr, "%s: %llu instrs ", tests[k].name, (unsigned long long)m68k_jit_stats.jit_instrs);
+                        fprintf(stderr, "%s: %llu instrs ", tests[k].name,
+                                (unsigned long long)(m68k_jit_stats.jit_instrs + m68k_jit_stats.fast_instrs));
                         sim_report(tests[k].name);
                 }
                 static const int reps[] = { 16, 64, 128, 256, 512, 1024 };
@@ -1331,14 +1862,19 @@ int main(int argc, char **argv)
                         uint32_t t0 = m68k_jit_stats.translations;
                         m68k_jit_execute(8 * (reps[k] * 12 + 1000));
                         sim_report("warmup");
-                        m68k_jit_stats.jit_instrs = 0;
+                        m68k_jit_stats.jit_instrs = m68k_jit_stats.fast_instrs = 0;
                         uint64_t blk0 = m68k_jit_stats.blocks;
                         m68k_jit_execute(8 * 400000);
                         fprintf(stderr, "footprint %d: %llu code bytes, %u translations, %llu instrs, %llu dispatches ",
                                 reps[k] * 4 + 1, (unsigned long long)(m68k_jit_stats.code_bytes - b0),
-                                m68k_jit_stats.translations - t0, (unsigned long long)m68k_jit_stats.jit_instrs,
+                                m68k_jit_stats.translations - t0, (unsigned long long)(m68k_jit_stats.jit_instrs + m68k_jit_stats.fast_instrs),
                                 (unsigned long long)(m68k_jit_stats.blocks - blk0));
                         sim_report("footprint");
+                }
+                if (iprof) {
+                        FILE *f = fopen(getenv("INTERPPROF"), "wb");
+                        fwrite(iprof, 4, 0x8000, f);
+                        fclose(f);
                 }
                 return 0;
         }
@@ -1393,6 +1929,9 @@ int main(int argc, char **argv)
                         } else {
                                 size_report();
                         }
+                } else if (!strcmp(argv[i], "ifuzz")) {
+                        int trials = atoi(argv[++i]);
+                        interp_fuzz(trials, (uint32_t)strtoul(argv[++i], 0, 0));
                 } else if (!strcmp(argv[i], "bltfuzz")) {
                         int trials = atoi(argv[++i]);
                         blt_fuzz(trials, (uint32_t)strtoul(argv[++i], 0, 0));
@@ -1445,6 +1984,30 @@ int main(int argc, char **argv)
                 }
         }
         report("end");
+        if (hp_reg < 13) {
+                uint64_t tc = 0, tn = 0;
+                for (int i = 0; i < 256; i++)
+                        tc += hp_cost[i], tn += hp_n[i];
+                fprintf(stderr, "handler profile: %.1f ARM instrs per dispatch\n", (double)tc / tn);
+                for (int k = 0; k < 40; k++) {
+                        int b = 0;
+                        for (int i = 1; i < 256; i++)
+                                if (hp_cost[i] > hp_cost[b])
+                                        b = i;
+                        if (!hp_cost[b])
+                                break;
+                        fprintf(stderr, "  handler %3d: %5.1f%% of dispatches, %5.1f%% of ARM instrs, %5.1f per dispatch\n", b,
+                                100.0 * hp_n[b] / tn, 100.0 * hp_cost[b] / tc, hp_n[b] ? (double)hp_cost[b] / hp_n[b] : 0);
+                        hp_cost[b] = 0;
+                }
+        }
+        if (opmix)
+                opmix_report();
+        if (iprof) {
+                FILE *f = fopen(getenv("INTERPPROF"), "wb");
+                fwrite(iprof, 4, 0x8000, f);
+                fclose(f);
+        }
         for (int k = 0; k < m68k_native_count; k++)
                 fprintf(stderr, "  native %06x %-24s %8u calls %10llu instrs\n", m68k_natives[k].pc, m68k_natives[k].name,
                         m68k_native_stats[k].calls, (unsigned long long)m68k_native_stats[k].instrs);

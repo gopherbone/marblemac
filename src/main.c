@@ -743,12 +743,12 @@ static void draw_stats(unsigned int now)
                                                  (double)js->t_native * 1000, (double)js->t_aline * 1000,
                                                  (unsigned long)js->idle_quanta);
                         js->t_native = js->t_aline = 0;
-                        pd->system->logToConsole("marblemac: %.1fs: emu %.0fms (run %.0f xlat %.0f interp %.0f) jit %lu interp %lu blocks %lu xlat %lu",
+                        pd->system->logToConsole("marblemac: %.1fs: emu %.0fms (run %.0f xlat %.0f interp %.0f) jit %lu interp %lu (Musashi %lu) blocks %lu xlat %lu",
                                                  (double)(now - prof_ms0) / 1000, (double)js->t_total * 1000,
                                                  (double)js->t_run * 1000, (double)js->t_xlat * 1000,
                                                  (double)js->t_interp * 1000, (unsigned long)js->jit_instrs,
-                                                 (unsigned long)js->interp_instrs, (unsigned long)js->blocks,
-                                                 (unsigned long)js->translations);
+                                                 (unsigned long)js->fast_instrs, (unsigned long)js->interp_instrs,
+                                                 (unsigned long)js->blocks, (unsigned long)js->translations);
                         js->t_total = js->t_run = js->t_xlat = js->t_interp = 0;
                         prof_ms0 = now;
 #endif
@@ -1021,32 +1021,40 @@ static void init(void)
                         { "mem 4KB (cached)", mem2, sizeof mem2 / 2, 0x20000 },
                         { "mem 256KB (misses)", mem3, sizeof mem3 / 2, 0x20000 },
                 };
-                for (unsigned k = 0; k < sizeof tests / sizeof *tests; k++) {
-                        for (int i = 0; i < tests[k].n; i++)
-                                RAM_WR16(0x10000 + i * 2, tests[k].code[i]);
-                        m68k_jit_note_write(0x10000, tests[k].n * 2);   /* drop old translations */
+                /* Each loop translated (tier 1), then interpreted (tier 0) */
+                extern int m68k_jit_tier;
+                int tier0 = m68k_jit_tier;
+                for (unsigned k = 0; k < 2 * sizeof tests / sizeof *tests; k++) {
+                        m68k_jit_tier = k & 1 ? 0 : 1;
+                        for (int i = 0; i < tests[k / 2].n; i++)
+                                RAM_WR16(0x10000 + i * 2, tests[k / 2].code[i]);
+                        m68k_jit_note_write(0x10000, tests[k / 2].n * 2);       /* drop old translations */
                         overlay = 0;
                         m68k_set_reg(16, 0x10000);
-                        m68k_set_reg(9, tests[k].a1);   /* A1 */
-                        m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = 0;
+                        m68k_set_reg(9, tests[k / 2].a1);       /* A1 */
+                        m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = m68k_jit_stats.fast_instrs = 0;
                         m68k_jit_execute(8 * 1000);     /* warm up: translate */
-                        m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = 0;
+                        m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = m68k_jit_stats.fast_instrs = 0;
                         float t0 = pd->system->getElapsedTime();
                         m68k_jit_execute(8 * 400000);
                         float t1 = pd->system->getElapsedTime();
-                        unsigned long n = (unsigned long)(m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs);
-                        pd->system->logToConsole("bench: jit %s: %.0f ns/instr (%lu instrs, %lu interp)",
-                                                 tests[k].name, (double)((t1 - t0) * 1e9f / n), n,
+                        unsigned long n = (unsigned long)(m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs +
+                                                          m68k_jit_stats.fast_instrs);
+                        pd->system->logToConsole("bench: %s %s: %.0f ns/instr (%lu instrs, %lu by Musashi)",
+                                                 k & 1 ? "interpreter" : "jit", tests[k / 2].name,
+                                                 (double)((t1 - t0) * 1e9f / n), n,
                                                  (unsigned long)m68k_jit_stats.interp_instrs);
                 }
                 /* Code footprint: one long straight loop of k register ops,
                  * so the generated code grows past the I-cache.
                  */
                 static const int reps[] = { 16, 64, 128, 256, 512 };   /* (bigger trips the 10s watchdog) */
-                for (unsigned k = 0; k < sizeof reps / sizeof *reps; k++) {
+                for (unsigned k = 0; k < 2 * sizeof reps / sizeof *reps; k++) {
+                        m68k_jit_tier = k < sizeof reps / sizeof *reps ? 1 : 0;
                         static const uint16_t body[4] = { 0xD481, 0xD682, 0xB781, 0x5281 };
                         uint32_t a = 0x10000;
-                        for (int i = 0; i < reps[k]; i++)
+                        int nrep = reps[k % (sizeof reps / sizeof *reps)];
+                        for (int i = 0; i < nrep; i++)
                                 for (int j = 0; j < 4; j++, a += 2)
                                         RAM_WR16(a, body[j]);
                         RAM_WR16(a, 0x6000);                    /* bra.w 0x10000 */
@@ -1055,21 +1063,24 @@ static void init(void)
                         overlay = 0;
                         m68k_set_reg(16, 0x10000);
                         uint64_t bytes0 = m68k_jit_stats.code_bytes;
-                        m68k_jit_execute(8 * (reps[k] * 4 * 3 + 1000));  /* warm up: translate */
+                        m68k_jit_execute(8 * (nrep * 4 * 3 + 1000));    /* warm up: translate */
                         uint64_t bytes = m68k_jit_stats.code_bytes - bytes0;
-                        m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = 0;
+                        m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = m68k_jit_stats.fast_instrs = 0;
                         float t0 = pd->system->getElapsedTime();
                         m68k_jit_execute(8 * 400000);
                         float t1 = pd->system->getElapsedTime();
-                        unsigned long n = (unsigned long)(m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs);
-                        pd->system->logToConsole("bench: jit footprint %d instrs, %lu code bytes: %.0f ns/instr",
-                                                 reps[k] * 4 + 1, (unsigned long)bytes, (double)((t1 - t0) * 1e9f / n));
+                        unsigned long n = (unsigned long)(m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs +
+                                                          m68k_jit_stats.fast_instrs);
+                        pd->system->logToConsole("bench: %s footprint %d instrs, %lu code bytes: %.0f ns/instr",
+                                                 m68k_jit_tier ? "jit" : "interpreter", nrep * 4 + 1,
+                                                 (unsigned long)bytes, (double)((t1 - t0) * 1e9f / n));
                 }
+                m68k_jit_tier = tier0;
                 memset(mac_ram, 0, RAM_SIZE);
                 mac_ram[0x2af] = 0x40;
                 overlay = 1;
                 umac_init(mac_ram, mac_rom, discs);
-                m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = 0;
+                m68k_jit_stats.jit_instrs = m68k_jit_stats.interp_instrs = m68k_jit_stats.fast_instrs = 0;
         }
 #endif
 #endif

@@ -22,6 +22,7 @@
 #include "m68kcpu.h"
 #include "m68kjit.h"
 #include "m68knative.h"
+#include "m68kjit_int.h"
 #include "thumb.h"
 
 /* umac memory accessors (slow paths) */
@@ -607,9 +608,6 @@ static uint32_t h_rte(uint32_t pc, uint32_t b)
  * spec: bits 0-15 register mask, 16 = long, 17 = memory to registers,
  * 18 = -(An) (store) / (An)+ (load) addressing, 20-22 = An.
  */
-#define MV_LONG         (1u << 16)
-#define MV_TOREGS       (1u << 17)
-#define MV_AUTO         (1u << 18)
 
 static uint32_t mv_read(uint32_t a, int lng)
 {
@@ -753,7 +751,15 @@ static uint32_t h_movem(uint32_t ea, uint32_t spec)
                         if (!(mask & (1u << i)))
                                 continue;
                         ea -= size;
-                        mv_write(ea, J->dar[15 - i], lng);
+                        if (lng) {
+                                /* (as Musashi: two words, the low one first;
+                                 * it matters off the end of RAM)
+                                 */
+                                mv_write(ea + 2, J->dar[15 - i] & 0xffff, 0);
+                                mv_write(ea, J->dar[15 - i] >> 16, 0);
+                        } else {
+                                mv_write(ea, J->dar[15 - i], 0);
+                        }
                 }
                 J->dar[an] = ea;
         } else {
@@ -771,6 +777,43 @@ uint32_t (*const m68k_jit_helper_fn[JH_COUNT])(uint32_t, uint32_t) = {
         h_rd8, h_rd16, h_rd32, h_wr8, h_wr16, h_wr32, h_codewrite, h_aline,
         h_getsr, h_srop, h_movetosr, h_rte, h_interp, h_movem, h_native,
 };
+
+/* The same helpers, for the interpreter (m68kjit_int.h) */
+uint32_t m68k_jit_h_aline(uint32_t pc) { return h_aline(pc, 0); }
+uint32_t m68k_jit_h_native(uint32_t idx, uint32_t pc) { return h_native(idx, pc); }
+uint32_t m68k_jit_h_srop(uint32_t pc, uint32_t arg) { return h_srop(pc, arg); }
+uint32_t m68k_jit_h_rte(uint32_t pc) { return h_rte(pc, 0); }
+uint32_t m68k_jit_h_interp(uint32_t pc) { return h_interp(pc, 0); }
+void m68k_jit_h_movem(uint32_t ea, uint32_t spec) { h_movem(ea, spec); }
+uint32_t m68k_jit_set_sr_then(uint32_t sr, uint32_t next) { return set_sr_then(sr, next); }
+uint32_t m68k_jit_h_wr8(uint32_t addr, uint32_t v) { return h_wr8(addr, v); }
+int m68k_jit_check_write(uint32_t addr, uint32_t size) { return check_write(addr, size); }
+
+uint32_t m68k_jit_h_super(void) { return m68ki_cpu.s_flag == SFLAG_SET; }
+
+uint32_t m68k_jit_h_div0(uint32_t pc)
+{
+        J->pc = pc;
+        m68k_jit_sync_out();
+        m68ki_exception_trap(EXCEPTION_ZERO_DIVIDE);
+        m68k_jit_sync_in();
+        return J->pc;
+}
+
+void (*m68k_jit_interp_observer)(uint32_t pc, uint32_t opcode);
+
+uint32_t m68k_jit_h_fallback(uint32_t pc)
+{
+        if (m68k_jit_interp_observer)
+                m68k_jit_interp_observer(pc, peek16(pc));
+        m68k_jit_stats.fast_fallbacks++;
+        return h_interp(pc, 0);
+}
+
+void m68k_jit_use_regs(jregs_t *j)
+{
+        J = j;
+}
 
 /* -------------------------------------------------------------------- */
 /* Translation context                                                  */
@@ -2482,6 +2525,8 @@ static int translate_one(tctx_t *t, uint32_t op)
 /* -------------------------------------------------------------------- */
 /* Blocks                                                               */
 
+static jit_entry_t *get_block(uint32_t pc);
+
 static jit_entry_t *lookup_set(uint32_t pc)
 {
         uint32_t h = (pc * 0x9e3779b1u) >> (32 - TABLE_BITS);
@@ -3003,7 +3048,89 @@ int m68k_jit_init(const m68kjit_platform_t *p, uint8_t *r, uint32_t rsize,
         memset(table, 0, sizeof(jit_entry_t) << (TABLE_BITS + 1));
         code_end = code_buf + code_size / 2;
         emit_permanent();
+        /* The interpreter (it needs power-of-two RAM and ROM sizes) */
+        m68k_interp_heat = plat->alloc(1u << HEAT_BITS);
+        if (!m68k_interp_heat)
+                return -1;
+        memset(m68k_interp_heat, 0, 1u << HEAT_BITS);
+        m68k_interp_env_t *ie = &m68k_interp_env;
+        ie->ram = ram;
+        ie->rom = rom;
+        ie->codepage = codepage;
+        ie->heat = m68k_interp_heat;
+        ie->ram_size = ram_size;
+        ie->rom_mask = rom_size - 1;
+        if ((ram_size & (ram_size - 1)) || (rom_size & (rom_size - 1)))
+                m68k_jit_tier = 1;
         return 0;
+}
+
+/* The block for pc if it's been translated, else NULL */
+static jit_entry_t *find_block(uint32_t pc)
+{
+        jit_entry_t *set = lookup_set(pc);
+        if (entry_valid(&set[0], pc))
+                return &set[0];
+        if (entry_valid(&set[1], pc))
+                return &set[1];
+        return NULL;
+}
+
+/* Tiering (m68kinterp.c is the interpreter):
+ *  0: interpret everything (natives still run);
+ *  1: translate every block (the JIT as it always was);
+ *  2: interpret, and translate the hot loops: a loop head once backward
+ *     branches have gone to it m68k_jit_hot_threshold times lately;
+ *  3: interpret, and translate whatever runs often: any branch, jump,
+ *     call or return target reached that often lately.
+ * In 2 and 3, translated code leaving for untranslated code heats that
+ * up too (m68k_jit_exit_heat), and heat halves every m68k_jit_heat_decay
+ * instructions' time.  The trade: the interpreter's handlers stay in the
+ * I-cache, translated code mostly doesn't (and translating costs a lot
+ * on the device), but cached translated code is several times faster.
+ */
+#ifndef JIT_TIER
+#define JIT_TIER        3
+#endif
+#ifndef JIT_HOT_THRESHOLD
+#define JIT_HOT_THRESHOLD 8
+#endif
+/* Tiers 2 and 3: translated code leaving for untranslated code heats
+ * that up too (by this much), so hot code gets translated whole (callees
+ * included) instead of bouncing between the tiers, which costs: each
+ * short stay in the interpreter finds its code evicted from the I-cache
+ * by translated code, and vice versa.
+ */
+#ifndef JIT_EXIT_HEAT
+#define JIT_EXIT_HEAT   1
+#endif
+int m68k_jit_tier = JIT_TIER;
+uint8_t *m68k_interp_heat;
+int m68k_jit_hot_threshold = JIT_HOT_THRESHOLD;
+int m68k_jit_exit_heat = JIT_EXIT_HEAT;
+
+/* Tiers 0, 2 and 3: the block for pc, if it should run translated.
+ * from_jit: translated code just left for pc.
+ */
+static jit_entry_t *tier_block(uint32_t pc, int from_jit)
+{
+        if (m68k_jit_tier == 0)
+                return NULL;
+        jit_entry_t *ent = find_block(pc);
+        uint8_t *h = &m68k_interp_heat[m68k_heat_index(pc)];
+        if (ent) {
+                if (!ent->code)
+                        *h = 0;         /* (known not to translate) */
+                return ent;
+        }
+        if (from_jit && m68k_jit_exit_heat)
+                *h = *h + m68k_jit_exit_heat > 255 ? 255 : *h + m68k_jit_exit_heat;
+        if (*h < m68k_jit_hot_threshold)
+                return NULL;
+        ent = get_block(pc);
+        if (!ent->code)
+                *h = 0;         /* (can't translate it: stop asking for a while) */
+        return ent;
 }
 
 /* Find (or translate) the block for pc */
@@ -3039,8 +3166,8 @@ static jit_entry_t *get_block(uint32_t pc)
  */
 static void link_exit(uint32_t e, uint32_t recycles)
 {
-        jit_entry_t *next = get_block(J->pc);
-        if (!next->code || m68k_jit_stats.recycles != recycles || e >= nexits)
+        jit_entry_t *next = m68k_jit_tier == 1 ? get_block(J->pc) : tier_block(J->pc, 1);
+        if (!next || !next->code || m68k_jit_stats.recycles != recycles || e >= nexits)
                 return;
         /* An exit that leaves its flags unstored needs a target that
          * overwrites them (RAM code may have changed since it was built)
@@ -3076,8 +3203,6 @@ static void check_interrupts(void)
                 m68k_jit_sync_in();
         }
 }
-
-void (*m68k_jit_interp_observer)(uint32_t pc, uint32_t opcode);
 
 /* One instruction through Musashi */
 static void interp_one(void)
@@ -3117,7 +3242,7 @@ static void maybe_relayout(void)
 {
         static uint64_t win_instrs;
         static uint32_t win_xlat, streak, since = RELAYOUT_GAP;
-        uint64_t done = m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs;
+        uint64_t done = m68k_jit_stats.jit_instrs + m68k_jit_stats.interp_instrs + m68k_jit_stats.fast_instrs;
         if (done - win_instrs < RELAYOUT_WINDOW)
                 return;
         streak = m68k_jit_stats.translations - win_xlat <= RELAYOUT_QUIET ? streak + 1 : 0;
@@ -3132,11 +3257,76 @@ static void maybe_relayout(void)
         }
 }
 
+/* Heat decays: every loop head's count halves this often (68k
+ * instructions' worth of time), so "hot" means "lately"
+ */
+#ifndef JIT_HEAT_DECAY
+#define JIT_HEAT_DECAY  (1 << 16)
+#endif
+int m68k_jit_heat_decay = JIT_HEAT_DECAY;
+
+/* The interpreter's view of the settings */
+void m68k_interp_env_refresh(void)
+{
+        m68k_interp_env_t *ie = &m68k_interp_env;
+        static int nat_key = -1;
+        int key = m68k_jit_no_native ? 2 : m68k_jit_natives_all;
+        if (key != nat_key) {
+                /* (pcs of the natives in use, hashed) */
+                nat_key = key;
+                memset(ie->natbits, 0, sizeof ie->natbits);
+                for (int i = 0; i < m68k_native_count && !m68k_jit_no_native; i++) {
+                        uint32_t npc = m68k_natives[i].pc;
+                        if (m68k_native_lookup(npc) == i)
+                                ie->natbits[(npc >> 4) & 31] |= 1 << ((npc >> 1) & 7);
+                }
+        }
+        ie->tier = m68k_jit_tier;
+        ie->hot = m68k_jit_hot_threshold;
+}
+
+/* A run of the interpreter, from J->pc */
+static void run_interp(void)
+{
+        int32_t budget = (m68ki_remaining_cycles + 7) / 8;
+        if (m68k_jit_max_budget && budget > m68k_jit_max_budget)
+                budget = m68k_jit_max_budget;
+        J->budget = budget;
+        m68k_interp_env_refresh();
+        float t0 = plat->now ? plat->now() : 0;
+        int why = plat->interp ? plat->interp(J) : m68k_interp_run(J);
+        if (plat->now)
+                m68k_jit_stats.t_interp += plat->now() - t0;
+        int32_t n = budget - J->budget;
+        if (m68k_jit_idle_request) {
+                m68k_jit_idle_request = 0;
+                n -= IDLE_DRAIN;
+                sleeping = 1;
+                m68ki_remaining_cycles = 0;
+        }
+        m68ki_remaining_cycles -= 8 * n;
+        m68k_jit_stats.fast_instrs += n;
+        m68k_jit_stats.fast_runs++;
+        if (why == IX_HOT)
+                m68k_jit_stats.hot_exits++;
+        if (why == IX_NOFETCH && !sleeping)
+                interp_one();           /* (running outside RAM and ROM) */
+}
+
 int m68k_jit_execute(int num_cycles)
 {
         if (!plat)
                 return m68k_execute(num_cycles);        /* JIT unavailable */
         maybe_relayout();
+        if (m68k_jit_tier >= 2) {
+                static int32_t heat_clock;
+                heat_clock += num_cycles / 8;
+                if (heat_clock >= m68k_jit_heat_decay) {
+                        heat_clock = 0;
+                        for (uint32_t i = 0; i < 1u << HEAT_BITS; i++)
+                                m68k_interp_heat[i] >>= 1;
+                }
+        }
         float t_start = plat->now ? plat->now() : 0;
         jregs_t local;
         J = plat->regs ? plat->regs() : &local;
@@ -3167,8 +3357,8 @@ int m68k_jit_execute(int num_cycles)
                 }
 
                 uint32_t pc = J->pc;
-                jit_entry_t *ent = get_block(pc);
-                if (ent->code) {
+                jit_entry_t *ent = m68k_jit_tier == 1 ? get_block(pc) : tier_block(pc, 0);
+                if (ent && ent->code) {
                         int32_t budget = (m68ki_remaining_cycles + 7) / 8;
                         if (m68k_jit_max_budget && budget > m68k_jit_max_budget)
                                 budget = m68k_jit_max_budget;
@@ -3194,8 +3384,8 @@ int m68k_jit_execute(int num_cycles)
                         uint32_t ex = J->lastexit;
                         if (ex == JC_MISS) {
                                 J->lastexit = 0;
-                                jit_entry_t *next = get_block(J->pc);
-                                if (next->code && m68k_jit_stats.recycles == recycles && !m68k_jit_no_jcache) {
+                                jit_entry_t *next = m68k_jit_tier == 1 ? get_block(J->pc) : tier_block(J->pc, 1);
+                                if (next && next->code && m68k_jit_stats.recycles == recycles && !m68k_jit_no_jcache) {
                                         jc_t *jc = &jcache[jc_hash(J->pc)];
                                         jc->pc = J->pc;
                                         jc->code = plat->taddr(next->code + 1) | 1;
@@ -3204,6 +3394,8 @@ int m68k_jit_execute(int num_cycles)
                                 J->lastexit = 0;
                                 link_exit(ex - 1, recycles);
                         }
+                } else if (m68k_jit_tier != 1) {
+                        run_interp();
                 } else {
                         interp_one();
                 }
