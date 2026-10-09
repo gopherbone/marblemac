@@ -1090,6 +1090,7 @@ int M68K_FAST_FUNC(m68k_execute)(int num_cycles)
  */
 void m68k_step_one(void)
 {
+	m68ki_trace_t1(); /* (as m68k_execute does) */
 	REG_PPC = REG_PC;
 	REG_IR = m68ki_read_opcode_16();
 #ifdef M68K_COUNT_INSTRUCTIONS
@@ -1097,6 +1098,7 @@ void m68k_step_one(void)
 #endif
 	instruction_jump_table[REG_IR]();
 	USE_CYCLES(CYC_INSTRUCTION(REG_IR));
+	m68ki_exception_if_trace();
 }
 
 int m68k_cycles_run(void)

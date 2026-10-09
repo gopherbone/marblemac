@@ -33,6 +33,8 @@ before building:
   any DiskCopy or emulator header). System 6 works well.
   `tools/make_disk.py` can build one from a folder of System and app
   disk images (`pip install machfs` first).
+  `tools/add_mfs.py` adds the files from an old 400K (MFS) floppy, raw or
+  DiskCopy 4.2, into a folder on it.
 
 Then:
 

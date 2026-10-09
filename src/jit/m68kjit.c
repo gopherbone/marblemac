@@ -3355,7 +3355,10 @@ int m68k_jit_execute(int num_cycles)
                         m68ki_remaining_cycles = 0;
                         break;
                 }
-                if (!m68k_jit_enabled || overlay) {
+                /* Trace mode (some copy protection runs under it): Musashi
+                 * steps each instruction and takes the trace exceptions.
+                 */
+                if (!m68k_jit_enabled || overlay || m68ki_cpu.t1_flag || m68ki_cpu.t0_flag) {
                         interp_one();
                         check_interrupts();
                         continue;
