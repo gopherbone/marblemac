@@ -3088,9 +3088,14 @@ static jit_entry_t *find_block(uint32_t pc)
  * instructions' time.  The trade: the interpreter's handlers stay in the
  * I-cache, translated code mostly doesn't (and translating costs a lot
  * on the device), but cached translated code is several times faster.
+ *
+ * Device A/B (MARBLE_TIMING, ms per 5 emulated s; boot / idle / busy
+ * Finder / Tetris title): always-JIT 8724 / 4208 / 21880 / 2970,
+ * never-JIT 5730 / 3775 / 17483 / 3255; tiers 2 and 3 were worse than
+ * either.  So: interpret.
  */
 #ifndef JIT_TIER
-#define JIT_TIER        3
+#define JIT_TIER        0
 #endif
 #ifndef JIT_HOT_THRESHOLD
 #define JIT_HOT_THRESHOLD 8
