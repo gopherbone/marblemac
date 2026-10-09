@@ -369,7 +369,7 @@ static uint32_t h_aline_body(uint32_t pc)
         cpu_write_word(a7 & 0xffffff, sr);
         J->dar[15] = a7;
         uint32_t vec = cpu_read_long((m68ki_cpu.vbr + 0x28) & 0xffffff);
-        if ((vec == 0x401f52 || vec == 0x401f4a) && !m68k_jit_no_native) {
+        if ((vec == 0x401f52 || vec == 0x401f4a) && !m68k_jit_no_native && m68k_jit_natives_all) {
                 uint32_t n;
                 uint32_t to = aline_dispatch(a7, vec == 0x401f4a, &n);
                 J->native_n += n;

@@ -28,6 +28,9 @@ extern const m68k_native_t m68k_natives[];
 /* Per routine: times run and 68k instructions stood in for */
 extern struct m68k_native_stat { uint32_t calls; uint64_t instrs; } m68k_native_stats[];
 extern const int m68k_native_count;
+/* All natives, not just the ones that pay on the device (and the native
+ * A-line dispatch); default JIT_NATIVES_ALL (0) */
+extern int m68k_jit_natives_all;
 /* Index into m68k_natives of the routine at pc, or -1 */
 int     m68k_native_lookup(uint32_t pc);
 

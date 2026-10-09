@@ -2606,10 +2606,27 @@ const m68k_native_t m68k_natives[] = {
 const int m68k_native_count = sizeof m68k_natives / sizeof m68k_natives[0];
 struct m68k_native_stat m68k_native_stats[sizeof m68k_natives / sizeof m68k_natives[0]];
 
+#ifndef JIT_NATIVES_ALL
+#define JIT_NATIVES_ALL 0
+#endif
+int m68k_jit_natives_all = JIT_NATIVES_ALL;
+
 int m68k_native_lookup(uint32_t pc)
 {
         pc &= 0xffffff;
         if (pc < 0x400000)
+                return -1;
+#ifdef JIT_NATIVE_ONLY
+        /* testing: just this one (a ROM pc) */
+        if (pc != JIT_NATIVE_ONLY)
+                return -1;
+#endif
+        /* On the device most natives cost more (their C code is as cold
+         * in the I-cache as the JIT code they replace) than they save;
+         * the blitter's row loop is the clear win.  The rest stay
+         * available (and verified) with m68k_jit_natives_all.
+         */
+        if (!m68k_jit_natives_all && pc != 0x40a41e)
                 return -1;
         for (int i = 0; i < m68k_native_count; i++)
                 if (m68k_natives[i].pc == pc)

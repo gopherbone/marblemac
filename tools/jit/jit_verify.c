@@ -1276,6 +1276,7 @@ int main(int argc, char **argv)
         m68k_jit_idle_yield = getenv("IDLE") != NULL;   /* (changes instruction counts) */
         extern int m68k_jit_no_native;
         m68k_jit_no_native = getenv("NONATIVE") != NULL;
+        m68k_jit_natives_all = getenv("ALLNATIVES") != NULL;
         extern int m68k_jit_no_traces;
         m68k_jit_no_traces = getenv("NOTRACE") != NULL;
         extern int m68k_jit_max_budget;
