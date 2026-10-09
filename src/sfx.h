@@ -18,6 +18,12 @@ void    sfx_thunk(float hardness);
  */
 void    sfx_rustle(float level);
 
+/* A hard landing: heavier and longer than any thunk */
+void    sfx_thunk_heavy(float hardness);
+/* The lander's engine, 0..1; call every frame, as sfx_rustle().  Played
+ * at the wall sound volume. */
+void    sfx_thrust(float level);
+
 /* Mouse button sounds: their own volume, 0..1 */
 void    sfx_set_click_volume(float vol);
 /* A soft, low thump for the button going down... */

@@ -3,10 +3,12 @@
 
 #include "pd_api.h"
 
-/* Live-tweakable marble physics.  B opens a panel: up/down picks a value,
- * left/right (or the crank) changes it.  Saved to the Data folder.
+/* Live-tweakable physics.  B opens a panel: up/down picks a value,
+ * left/right (or the crank) changes it.  Saved to the Data folder.  The
+ * first row picks the cursor mode; rows for the other mode are hidden.
  */
 typedef struct {
+        float mode;             /* MODE_MARBLE or MODE_LANDER */
         float tilt_gain;        /* px/s^2 per g of tilt */
         float drag;             /* viscous drag, 1/s */
         float roll_friction;    /* constant decel, px/s^2 */
@@ -22,9 +24,23 @@ typedef struct {
         float rope_k;           /* bungee stiffness, px/s^2 per px of stretch */
         float rope_damp;        /* bungee damping along the rope, 1/s */
         float swing_damp;       /* damping of the arrow swinging on the bungee, 1/s */
+        float lander_gravity;   /* px/s^2 */
+        float lander_thrust;    /* px/s^2 */
+        float lander_turn;      /* d-pad rotation, deg/s */
+        float lander_drag;      /* 1/s */
+        float lander_ground;    /* friction sliding on the floor, px/s^2 */
 } tuning_t;
 
+#define MODE_MARBLE     0
+#define MODE_LANDER     1
+
 extern tuning_t tune;
+
+/* The current mode, as an int */
+static inline int tuning_mode(void)
+{
+        return tune.mode >= 0.5f ? MODE_LANDER : MODE_MARBLE;
+}
 
 void    tuning_init(PlaydateAPI *pd);
 /* Handle input; returns 1 while the panel is open (it eats the d-pad) */

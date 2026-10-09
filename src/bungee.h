@@ -9,15 +9,19 @@
  * (forward) and out (backward), as do Up and Right held.  The anchor is
  * in Mac screen pixels, so it stays put on the Mac's screen as the view
  * scrolls.  Stiffness and damping are in the tuning panel.
+ *
+ * In lander mode (Up thrusts, the crank and Left/Right steer) it's all on
+ * Down: Down drops the anchor, a tap of Down lets go, and with Down held
+ * Up reels in and Right pays out.
  */
 
 void    bungee_init(PlaydateAPI *pd);
 /* Handle input.  panel_open = the tuning panel has the d-pad and crank
  * this frame, so leave them alone.  (px, py) is the marble.  enabled = 0
- * drops the rope (Mac not ready).
+ * drops the rope (Mac not ready).  lander = use lander mode's buttons.
  */
 void    bungee_input(PDButtons cur, PDButtons pushed, int panel_open, float dt,
-                     float px, float py, int enabled);
+                     float px, float py, int enabled, int lander);
 /* Apply the rope's pull to the marble's velocity, after the tilt has
  * been added and before drag/friction/position.  (gx, gy) is the tilt
  * acceleration in px/s^2, remembered for drawing the sag.
@@ -42,5 +46,8 @@ int     bungee_active(void);
  * step, after the steering and before the cursor's extent is used.
  */
 float   bungee_arrow(float angle, float vx, float vy, float gx, float gy, float dt);
+/* Forget any swing (the cursor mode changed: the next bungee_arrow()
+ * starts afresh from the angle it's given) */
+void    bungee_swing_reset(void);
 
 #endif

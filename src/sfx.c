@@ -30,6 +30,16 @@
  *    attack/release.  It's ducked while the wall scrape is sounding so the
  *    two together don't pile up into the clipper.
  *
+ *  - Engine: a third always-running voice for the lander's thruster.  A
+ *    low roar (noise through a band-pass a little above the speaker's
+ *    floor, given a ragged, fluttering amplitude and driven into a soft
+ *    clipper so its harmonics carry the weight) with a quieter hiss on
+ *    top and the odd crackle.  Same target/fade/stale scheme as the
+ *    rustles, with a quick "whoomph" of an attack and a slower spool-down.
+ *
+ *  - Crash: a hard landing is a heavier thunk (low, long, very driven)
+ *    layered with a short crunch of bright noise.
+ *
  * Everything the game thread sets is either a single 32-bit word or goes
  * through a small single-producer/single-consumer ring, so there's no
  * locking in the audio callback.
@@ -60,6 +70,13 @@
 #define DRAG_GAIN       0.80f
 #define DRAG_DUCK       0.45f
 
+/* Engine (lander thruster) */
+#define ENGINE_ATTACK   0.035f
+#define ENGINE_RELEASE  0.160f
+#define ENGINE_GAIN     1.4f
+#define ENGINE_ROAR_HZ  360.0f  /* roar band-pass centre */
+#define ENGINE_HISS_HZ  2400.0f
+
 ////////////////////////////////////////////////////////////////////////////////
 // Shared state
 
@@ -87,6 +104,8 @@ static volatile float rustle_target;
 static atomic_uint rustle_seq;  /* bumped on every sfx_rustle() */
 static volatile float drag_target;
 static atomic_uint drag_seq;    /* bumped on every sfx_drag() */
+static volatile float engine_target;
+static atomic_uint engine_seq;  /* bumped on every sfx_thrust() */
 
 static uint32_t game_rng = 0x2545F491u;
 static int last_preset = -1;
@@ -119,8 +138,16 @@ static float d_grain = 1, d_grain_t = 1;
 static int d_grain_n;
 static unsigned int d_seen_seq, d_stale_samples;
 
+static float e_gain;                    /* engine */
+static float e_low, e_band;             /* roar band-pass */
+static float h_low, h_band;             /* hiss band-pass */
+static float e_flut = 1, e_flut_t = 1, e_crack;
+static int e_flut_n;
+static unsigned int e_seen_seq, e_stale_samples;
+
 /* Envelope coefficients, worked out once in sfx_init() */
-static float ka_r, kr_r, ka_d, kr_d;
+static float ka_r, kr_r, ka_d, kr_d, ka_e, kr_e;
+static float e_f, h_f;                  /* engine filter coefficients */
 
 static inline uint32_t xorshift(uint32_t *s)
 {
@@ -244,11 +271,17 @@ static int render(void *ctx, int16_t *left, int16_t *right, int len)
                 any_voice |= voices[i].active;
         int scrape_on = target > 0 || r_gain >= 1e-4f;
         int drag_on = dtarget > 0 || d_gain >= 1e-3f;   /* slow tail: cut at -60dB */
+        float etarget = fresh(&engine_seq, &e_seen_seq, &e_stale_samples, len) ? engine_target : 0;
+        if (vol == 0)
+                etarget = 0;
+        int engine_on = etarget > 0 || e_gain >= 1e-3f;
+        if (!engine_on)
+                e_gain = 0;
         if (!scrape_on)
                 r_gain = 0;
         if (!drag_on)
                 d_gain = 0;
-        if (!any_voice && !scrape_on && !drag_on)
+        if (!any_voice && !scrape_on && !drag_on && !engine_on)
                 return 0;
 
         /* Per-block: filter centres follow the (smoothed) levels */
@@ -308,6 +341,29 @@ static int render(void *ctx, int16_t *left, int16_t *right, int len)
                         float high = w - d_low - dq * d_band;
                         d_band += d_f * high;
                         x += d_band * d_k * d_grain * d_gain * (1.0f - duck_k * r_gain);
+                }
+
+                if (engine_on) {
+                        e_gain += (etarget - e_gain) * (etarget > e_gain ? ka_e : kr_e);
+                        if (--e_flut_n <= 0) {
+                                /* ragged: a new level every 5-20ms */
+                                e_flut_n = 220 + (xorshift(&audio_rng) & 511);
+                                e_flut_t = 0.45f + 0.55f * frand(&audio_rng);
+                        }
+                        e_flut += (e_flut_t - e_flut) * 0.004f;
+                        if (frand(&audio_rng) < 0.0012f)
+                                e_crack = 0.2f + 0.3f * frand(&audio_rng);
+                        float w = noise(&audio_rng);
+                        e_low += e_f * e_band;
+                        float high = w - e_low - 0.7f * e_band;
+                        e_band += e_f * high;
+                        h_low += h_f * h_band;
+                        high = w - h_low - 1.2f * h_band;
+                        h_band += h_f * high;
+                        float roar = sat(4.5f * e_band * e_flut);
+                        float s = roar + 0.18f * h_band * (0.6f + 0.4f * e_flut) + w * e_crack;
+                        e_crack *= 0.8f;
+                        x += s * (ENGINE_GAIN * e_gain * vol);
                 }
 
                 /* Cubic soft clip: linear-ish to 0.5, flat at 2/3 */
@@ -460,6 +516,54 @@ void sfx_rustle(float level)
         atomic_fetch_add_explicit(&rustle_seq, 1, memory_order_relaxed);
 }
 
+/* A hard landing: a deep, long, heavily driven thud, with a crunch of
+ * bright noise on top.  h 0..1 as for sfx_thunk().
+ */
+void sfx_thunk_heavy(float h)
+{
+        h = fmaxf(0, fminf(1, h));
+        float vol = master_vol;
+        if (vol == 0)
+                return;
+        float jitter = 0.94f + 0.12f * frand(&game_rng);
+        if (!ring_full()) {
+                thunk_t t = {
+                        .amp = 1.0f,
+                        .f_end = 75.0f * jitter,
+                        .f_sweep = (300.0f + 120.0f * h - 75.0f) * jitter,
+                        .kp = per_sample(22 + 12 * h),
+                        .kb = per_sample(110 + 90 * h),
+                        .p2_ratio = 1.41f,
+                        .p2_amp = 0.25f,
+                        .n_amp = 2.4f,
+                        .kn = per_sample(18 + 14 * h),
+                        .drive = 3.0f + 3.0f * h,
+                };
+                post(&t, 900.0f + 900.0f * h, 0, vol);
+        }
+        if (!ring_full()) {
+                thunk_t t = {
+                        .amp = 0.5f + 0.4f * h,
+                        .f_end = 520.0f * jitter,
+                        .f_sweep = 700.0f * jitter,
+                        .kp = per_sample(6),
+                        .kb = per_sample(14),
+                        .p2_ratio = 2.71f,
+                        .p2_amp = 0.4f,
+                        .n_amp = 3.0f,
+                        .kn = per_sample(30 + 25 * h),
+                        .drive = 2.5f,
+                };
+                post(&t, 4200.0f, 0, vol * (0.45f + 0.35f * h));
+        }
+}
+
+void sfx_thrust(float level)
+{
+        engine_target = fmaxf(0, fminf(1, level));
+        atomic_fetch_add_explicit(&engine_seq, 1, memory_order_relaxed);
+}
+
 void sfx_drag(float level)
 {
         drag_target = fmaxf(0, fminf(1, level));
@@ -482,6 +586,10 @@ static void init_coefs(void)
         kr_r = 1.0f - expf(-1.0f / (RUSTLE_RELEASE * SR));
         ka_d = 1.0f - expf(-1.0f / (DRAG_ATTACK * SR));
         kr_d = 1.0f - expf(-1.0f / (DRAG_RELEASE * SR));
+        ka_e = 1.0f - expf(-1.0f / (ENGINE_ATTACK * SR));
+        kr_e = 1.0f - expf(-1.0f / (ENGINE_RELEASE * SR));
+        e_f = 2.0f * sinf((float)M_PI * ENGINE_ROAR_HZ / SR);
+        h_f = 2.0f * sinf((float)M_PI * ENGINE_HISS_HZ / SR);
 }
 
 void sfx_init(PlaydateAPI *pd)

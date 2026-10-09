@@ -38,6 +38,19 @@ static float sg_x, sg_y;                /* smoothed tilt acceleration */
 #define SAG_FULL_TILT   0.25f   /* fraction of full tilt for a full hang (~15 deg) */
 #define SAG_FLAT        0.3f    /* depth of the curve when lying flat, vs hanging */
 
+/* Lengthen the rope by dl px (negative reels in) */
+static void reel(float dl, float px, float py)
+{
+        if (dl < 0) {
+                /* Reeling in takes up any slack first */
+                float dx = px - anc_x, dy = py - anc_y;
+                float d = sqrtf(dx * dx + dy * dy);
+                if (rest > d)
+                        rest = d;
+        }
+        rest = fmaxf(0, fminf(MAX_LEN, rest + dl));
+}
+
 void bungee_init(PlaydateAPI *playdate)
 {
         pd = playdate;
@@ -48,17 +61,60 @@ int bungee_active(void)
         return active;
 }
 
+static int down_was, down_used;
+
+/* Lander mode: Up thrusts and the crank (or Left/Right) steers, so the
+ * rope lives on Down.  Down drops the anchor at once; anchored, a tap of
+ * Down lets go, and holding Down makes Up reel in and Right pay out.
+ */
+static void lander_input(PDButtons cur, PDButtons pushed, float dt, float px, float py)
+{
+        int down = (cur & kButtonDown) != 0;
+        if (pushed & kButtonDown) {
+                if (!active) {
+                        active = 1;
+                        anc_x = px;
+                        anc_y = py;
+                        rest = START_SLACK;
+                        down_used = 1;          /* releasing this press keeps it */
+                } else {
+                        down_used = 0;
+                }
+        }
+        float dl = 0;
+        if (down && active) {
+                if (cur & kButtonUp)
+                        dl -= REEL_RATE * dt;
+                if (cur & kButtonRight)
+                        dl += REEL_RATE * dt;
+                if (cur & (kButtonUp | kButtonRight))
+                        down_used = 1;
+        }
+        if (!down && down_was && !down_used)
+                active = 0;
+        down_was = down;
+        if (active)
+                reel(dl, px, py);
+}
+
 void bungee_input(PDButtons cur, PDButtons pushed, int panel_open, float dt,
-                  float px, float py, int enabled)
+                  float px, float py, int enabled, int lander)
 {
         /* The panel reads the crank itself while it's open */
-        if (panel_open)
+        if (panel_open) {
+                down_was = 0;
                 return;
+        }
         float crank = pd ? pd->system->getCrankChange() : 0;
         if (!enabled) {
                 active = 0;
                 return;
         }
+        if (lander) {
+                lander_input(cur, pushed, dt, px, py);
+                return;
+        }
+        down_was = 0;
 
         if (pushed & kButtonDown) {
                 active = !active;
@@ -79,14 +135,7 @@ void bungee_input(PDButtons cur, PDButtons pushed, int panel_open, float dt,
                 dl -= REEL_RATE * dt;
         if (cur & kButtonRight)
                 dl += REEL_RATE * dt;
-        if (dl < 0) {
-                /* Reeling in takes up any slack first */
-                float dx = px - anc_x, dy = py - anc_y;
-                float d = sqrtf(dx * dx + dy * dy);
-                if (rest > d)
-                        rest = d;
-        }
-        rest = fmaxf(0, fminf(MAX_LEN, rest + dl));
+        reel(dl, px, py);
 }
 
 void bungee_apply(float px, float py, float *vx, float *vy, float gx, float gy, float dt)
@@ -100,7 +149,10 @@ void bungee_apply(float px, float py, float *vx, float *vy, float gx, float gy, 
                         sag_gx = sg_x / gl;
                         sag_gy = sg_y / gl;
                 }
-                float w = fminf(1, gl / (SAG_FULL_TILT * fmaxf(tune.tilt_gain, 1)));
+                /* (the lander's gravity always counts as full) */
+                float full = tuning_mode() == MODE_LANDER ? tune.lander_gravity * 0.9f
+                                                          : SAG_FULL_TILT * tune.tilt_gain;
+                float w = fminf(1, gl / fmaxf(full, 1));
                 sag_w = w * w * (3 - 2 * w);
         }
         if (!active || dt <= 0)
@@ -155,6 +207,13 @@ static float sw_rel = RELEASE_T;        /* time since letting go */
 static float wrap(float a)
 {
         return remainderf(a, 2 * (float)M_PI);
+}
+
+void bungee_swing_reset(void)
+{
+        swing_on = 0;
+        sw_w = 0;
+        sw_rel = RELEASE_T;
 }
 
 float bungee_arrow(float angle, float vx, float vy, float gx, float gy, float dt)

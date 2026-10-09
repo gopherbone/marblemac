@@ -49,6 +49,7 @@ set(SOURCES
 	src/wallfx.c
 	src/clickfx.c
 	src/bungee.c
+	src/lander.c
 	src/jit/m68kjit.c
 	src/jit/m68knative.c
 	src/jit_playdate.c

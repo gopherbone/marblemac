@@ -15,6 +15,10 @@
  *  - Sliding: within TOUCH_DIST of a wall (held for a moment to bridge
  *    the micro-bounces) counts as touching, and the speed along the wall
  *    drives the scrape's level and a trickle of dust.
+ *
+ *  - The lander is slower than the marble, so its hits are judged on a
+ *    gentler scale, and coming down on the floor fast is a hard landing:
+ *    a heavier crash and a much bigger dust cloud, thrown up and out.
  */
 
 #include <math.h>
@@ -38,6 +42,11 @@
 #define PUFF_BASE       3.0f    /* specks for the softest thunk */
 #define PUFF_HARD       10.0f   /* extra specks for the hardest */
 #define SCRAPE_RATE     28.0f   /* specks/s scraping at full speed */
+
+#define LANDER_THUNK_FULL 600.0f /* px/s for the hardest lander thunk */
+#define HARD_LANDING    200.0f  /* px/s down into the floor: a crash */
+#define CRASH_FULL      480.0f  /* px/s for the worst crash */
+#define CRASH_SPECKS    34.0f   /* extra specks for the worst crash */
 
 enum { LEFT, RIGHT, TOP, BOTTOM };
 
@@ -78,6 +87,21 @@ static void speck(int i, float px, float py, float along, float out, float tan, 
         }
 }
 
+/* A hard landing at (px, py) on the floor: a wide, tall cloud, flung up
+ * and out to both sides, c 0..1 how hard */
+static void crash_dust(float px, float py, float span, float c, float vt, float dust_amt)
+{
+        int n = (int)(CRASH_SPECKS * (0.4f + 0.6f * c) * dust_amt + 0.5f);
+        float sp = fminf(span, 16.0f) + 6.0f;
+        for (int k = 0; k < n; k++) {
+                float side = frand() < 0.5f ? -1.0f : 1.0f;
+                float up = (60.0f + 200.0f * c) * (0.3f + 0.7f * frand());
+                float tan = side * (80.0f + 260.0f * c) * (0.2f + 0.8f * frand()) + 0.3f * vt;
+                float life = 0.4f + (0.3f + 0.5f * c) * frand();
+                speck(BOTTOM, px, py, (frand() - 0.5f) * sp, up, tan, life, frand() < 0.4f + 0.4f * c);
+        }
+}
+
 void wallfx_step(const wallfx_marble_t *m, float dt, float W, float H)
 {
         float dist[4] = {
@@ -97,7 +121,8 @@ void wallfx_step(const wallfx_marble_t *m, float dt, float W, float H)
         float span[4] = { len_y, len_y, len_x, len_x };
 
         float dust_amt = tune.dust;
-        float hit = 0, scrape = 0;
+        float hit = 0, scrape = 0, crash = 0;
+        float thunk_full = m->lander ? LANDER_THUNK_FULL : THUNK_FULL;
 
         for (int i = 0; i < 4; i++) {
                 wall_t *w = &walls[i];
@@ -108,7 +133,12 @@ void wallfx_step(const wallfx_marble_t *m, float dt, float W, float H)
 
                 if (dist[i] <= HIT_EPS && vn[i] > 0) {
                         if (w->armed && vn[i] >= THUNK_MIN && w->cooldown <= 0) {
-                                float h = clamp01((vn[i] - THUNK_MIN) / (THUNK_FULL - THUNK_MIN));
+                                float h = clamp01((vn[i] - THUNK_MIN) / (thunk_full - THUNK_MIN));
+                                if (m->lander && i == BOTTOM && vn[i] >= HARD_LANDING) {
+                                        float c = clamp01((vn[i] - HARD_LANDING) / (CRASH_FULL - HARD_LANDING));
+                                        crash = c + 1e-3f;
+                                        crash_dust(cpx[i], cpy[i], span[i], c, vt[i], dust_amt);
+                                }
                                 if (h + 1e-3f > hit)
                                         hit = h + 1e-3f;
                                 w->cooldown = COOLDOWN;
@@ -152,7 +182,9 @@ void wallfx_step(const wallfx_marble_t *m, float dt, float W, float H)
         }
 
         sfx_set_volume(tune.sfx_volume);
-        if (hit > 0)
+        if (crash > 0)
+                sfx_thunk_heavy(crash - 1e-3f);
+        else if (hit > 0)
                 sfx_thunk(hit - 1e-3f);
         sfx_rustle(scrape);
         dust_step(dt, m->gx, m->gy, W, H);

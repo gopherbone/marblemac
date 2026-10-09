@@ -7,6 +7,12 @@
  *
  * Controls: tilt to roll, A = mouse button, Down = bungee (crank reels).
  *
+ * Or, picked in the B panel, the cursor is a lunar lander instead:
+ * gravity pulls it down the screen, Up fires the engine along the nose,
+ * the crank points the nose (0 = up; docked, Left/Right turn it), A is
+ * still the button, and the bungee is Down (tap: drop/let go; held: Up
+ * reels in, Right pays out).
+ *
  * Emulation is uMac (Matt Evans) on Musashi.  Needs a Mac Plus v3 ROM
  * ("rom.bin") and a raw disk image ("disk.img"), either in the game's
  * Data folder or bundled in Source/.
@@ -32,6 +38,7 @@
 #include "wallfx.h"
 #include "clickfx.h"
 #include "bungee.h"
+#include "lander.h"
 #ifdef UMAC_JIT
 #include "jit_playdate.h"
 #include "m68kjit.h"
@@ -79,7 +86,8 @@ static int need_calibrate = 15; /* frames until we sample the "level" pose */
 
 static int mac_ready;           /* booted far enough to drive the cursor */
 static float mx, my, vx, vy;    /* marble */
-static float angle;             /* direction arrow points */
+static float angle;             /* direction arrow points (the lander's nose) */
+static int cur_mode = -1;       /* MODE_MARBLE / MODE_LANDER being simulated */
 static float cam_x, cam_y;
 static float ext_x0, ext_x1, ext_y0, ext_y1;   /* cursor footprint around hotspot */
 
@@ -382,6 +390,62 @@ static void step_marble(float dt)
         }, dt, MAC_W, MAC_H);
 }
 
+/* The lander: gravity, the engine, the nose steered by the crank or the
+ * d-pad.  Same walls, sounds and dust as the marble.
+ */
+static void step_lander(float dt, PDButtons cur, int panel_open)
+{
+        const lander_params_t p = {
+                .gravity = tune.lander_gravity,
+                .thrust = tune.lander_thrust,
+                .turn = tune.lander_turn,
+                .drag = tune.lander_drag,
+                .ground_friction = tune.lander_ground,
+                .max_speed = tune.max_speed,
+                .wall_bounce = tune.wall_bounce,
+        };
+        /* While Down is held the d-pad works the bungee's reel */
+        int roping = (cur & kButtonDown) != 0;
+        int controls = !panel_open && !roping;
+        lander_steer_t st = {
+                .steer = !panel_open,
+                .docked = pd->system->isCrankDocked(),
+                .crank_deg = pd->system->getCrankAngle(),
+                .rot = controls ? ((cur & kButtonRight) != 0) - ((cur & kButtonLeft) != 0) : 0,
+        };
+        angle = lander_steer(angle, &st, &p, dt);
+        int thrust = controls && (cur & kButtonUp);
+
+        float ax, ay;
+        lander_accel(angle, thrust, &p, &ax, &ay);
+        vx += ax * dt;
+        vy += ay * dt;
+        /* (the nose wins over the rope: no pendulum here) */
+        bungee_apply(mx, my, &vx, &vy, 0, p.gravity, dt);
+
+        update_extent();
+        float in_vx, in_vy;
+        lander_move(&mx, &my, &vx, &vy, &p, ext_x0, ext_x1, ext_y0, ext_y1,
+                    MAC_W, MAC_H, dt, &in_vx, &in_vy);
+
+        wallfx_step(&(wallfx_marble_t){
+                .x = mx, .y = my, .vx = in_vx, .vy = in_vy, .ovx = vx, .ovy = vy,
+                .x0 = ext_x0, .x1 = ext_x1, .y0 = ext_y0, .y1 = ext_y1,
+                .gx = 0, .gy = p.gravity, .lander = 1,
+        }, dt, MAC_W, MAC_H);
+        lander_flame_step(thrust, mx, my, angle, MAC_W, MAC_H, tune.dust, dt);
+        sfx_thrust(thrust ? 1.0f : 0.0f);
+}
+
+/* Switching modes: stop dead where it is (pointing wherever it was), so
+ * neither mode inherits the other's momentum */
+static void set_mode(int mode)
+{
+        cur_mode = mode;
+        vx = vy = 0;
+        bungee_swing_reset();
+}
+
 static void step_camera(float dt)
 {
         float tx = mx + vx * tune.cam_lookahead - LCD_COLUMNS / 2;
@@ -632,6 +696,9 @@ static void blit(void)
         if (mac_ready) {
                 mac_unerase_cursor(&undo);
                 if (mac_cursor_visible()) {
+                        if (cur_mode == MODE_LANDER)
+                                lander_flame_draw(frame, LCD_ROWSIZE, LCD_COLUMNS, LCD_ROWS,
+                                                  (int)mx - cx, (int)my - cy, angle);
                         mac_cursor_t c;
                         mac_get_cursor(&c);
                         cursor_draw(frame, LCD_ROWSIZE, LCD_COLUMNS, LCD_ROWS, &c,
@@ -768,8 +835,11 @@ static int update(void *ud)
                 my = (int16_t)RAM_RD16(LM_MOUSE);
                 mx = (int16_t)RAM_RD16(LM_MOUSE + 2);
                 vx = vy = 0;
-                angle = CURSOR_ARROW_ANGLE;
+                /* (a lander starts upright) */
+                angle = tuning_mode() == MODE_LANDER ? -(float)M_PI / 2 : CURSOR_ARROW_ANGLE;
         }
+        if (tuning_mode() != cur_mode)
+                set_mode(tuning_mode());
 
 #ifdef MARBLE_TIMING
         cur = pushed = 0;
@@ -777,10 +847,13 @@ static int update(void *ud)
         mx = MAC_W / 2;
         my = MAC_H / 2;
 #endif
-        bungee_input(cur, pushed, panel_open, dt, mx, my, mac_ready);
+        bungee_input(cur, pushed, panel_open, dt, mx, my, mac_ready, cur_mode == MODE_LANDER);
 #ifndef MARBLE_TIMING           /* (there, timing_input() drives the mouse) */
         if (mac_ready) {
-                step_marble(dt);
+                if (cur_mode == MODE_LANDER)
+                        step_lander(dt, cur, panel_open);
+                else
+                        step_marble(dt);
                 mac_set_mouse((int)mx, (int)my);
         }
         umac_mouse(0, 0, (cur & kButtonA) ? 1 : 0);

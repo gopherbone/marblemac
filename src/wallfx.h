@@ -10,6 +10,7 @@ typedef struct {
         float ovx, ovy;         /* ...and after it */
         float x0, x1, y0, y1;   /* cursor footprint around the hotspot */
         float gx, gy;           /* tilt acceleration, px/s^2 */
+        int lander;             /* lander mode: gentler scale, hard landings */
 } wallfx_marble_t;
 
 void    wallfx_step(const wallfx_marble_t *m, float dt, float screen_w, float screen_h);
