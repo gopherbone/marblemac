@@ -1964,6 +1964,21 @@ int main(int argc, char **argv)
                                 fclose(f);
                                 memset(iexec, 0, 0x1000000 * 4);
                         }
+                } else if (!strcmp(argv[i], "dis")) {
+                        /* dis HEXPC N: disassemble from current memory */
+                        uint32_t pc = strtoul(argv[++i], 0, 16);
+                        disasm_block(pc, atoi(argv[++i]));
+                } else if (!strcmp(argv[i], "hotpcs")) {
+                        /* hotpcs N: the most executed pcs since counting began (needs "sizes") */
+                        int n = atoi(argv[++i]);
+                        for (int k = 0; k < n && iexec; k++) {
+                                uint32_t best = 0, bv = 0;
+                                for (uint32_t pc = 0; pc < 0x420000; pc++)
+                                        if (iexec[pc] > bv) { bv = iexec[pc]; best = pc; }
+                                if (!bv) break;
+                                fprintf(stderr, "  hot %06x x%u\n", best, bv);
+                                iexec[best] = 0;
+                        }
                 } else if (!strcmp(argv[i], "traps")) {
                         if (!trapprof_on) {
                                 trapprof_on = 1;

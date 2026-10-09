@@ -156,7 +156,9 @@ static uint8_t  scc_rr0(int AnB)
         } else {
                 v = (scc_dcd_pins & 2) ? 0x08 : 0;
         }
-        // (Other bits: [2] = TX empty, [5] = /CTS)
+        // ([5] = /CTS)
+        v |= 0x04; // TX buffer empty: nothing's attached, so sends finish at once
+                   // (AppleTalk's send loop polls this and would spin forever)
         v |= 0x10; // Sync/Hunt status (set on reset/by hunt?)
         v |= 0x40; // TxUnderrun/EOM
 
