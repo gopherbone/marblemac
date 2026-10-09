@@ -318,6 +318,78 @@ static void update_extent(void)
         cursor_extent(&c, cursor_rotation(&c), &ext_x0, &ext_x1, &ext_y0, &ext_y1);
 }
 
+/* Click snag: pressing the button catches the pointer's tip on the
+ * screen for a moment (tune.snag_time), and the arrow's own momentum
+ * flips it round that pivot.  Then it lets go, carrying on as it was, and
+ * swings back to point where it's going.  A second press within the
+ * Mac's double-click time lands on exactly the first press's pixel.
+ */
+static struct {
+        float t;                /* time left pinned */
+        float x, y;             /* the pinned hotspot */
+        float vx, vy;           /* momentum to carry on with */
+        float a0, a1;           /* the flip: from, to */
+        float since;            /* time since the last press */
+        float px, py;           /* where the last press landed */
+} snag = { .since = 1e9f };
+
+#define LM_DOUBLETIME   0x2f0   /* long: double-click time, ticks */
+
+static void snag_press(void)
+{
+        float dbl = (float)RAM_RD32(LM_DOUBLETIME) / 60.0f;
+        if (dbl <= 0 || dbl > 2)
+                dbl = 0.5f;
+        if (snag.since < dbl) {
+                mx = snag.px;           /* the double-click's second half */
+                my = snag.py;
+        } else {
+                mx = floorf(mx);
+                my = floorf(my);
+                snag.px = mx;
+                snag.py = my;
+        }
+        snag.since = 0;
+        if (tune.snag_time <= 0)
+                return;
+        if (snag.t <= 0) {
+                /* Caught: the tail keeps going, so the arrow swings right
+                 * round its tip, whichever way the motion pushes it.
+                 */
+                snag.vx = vx;
+                snag.vy = vy;
+                float cross = cosf(angle) * vy - sinf(angle) * vx;
+                snag.a0 = angle;
+                snag.a1 = angle + (cross >= 0 ? (float)M_PI : -(float)M_PI);
+        }
+        snag.x = mx;
+        snag.y = my;
+        snag.t = tune.snag_time;
+        vx = vy = 0;
+}
+
+/* Returns 1 while pinned (the physics step is skipped) */
+static int snag_step(float dt)
+{
+        snag.since += dt;
+        if (snag.t <= 0)
+                return 0;
+        snag.t -= dt;
+        mx = snag.x;
+        my = snag.y;
+        /* A quick swing with a little overshoot, settling at the flip */
+        float u = fminf(1, 1 - snag.t / fmaxf(tune.snag_time, 1e-3f));
+        float e = 1 + 2.2f * powf(u - 1, 3) + 1.2f * powf(u - 1, 2);
+        angle = remainderf(snag.a0 + (snag.a1 - snag.a0) * e, 2 * (float)M_PI);
+        if (snag.t <= 0) {
+                vx = snag.vx;   /* let go: carry on */
+                vy = snag.vy;
+                return 0;
+        }
+        vx = vy = 0;
+        return 1;
+}
+
 static void step_marble(float dt)
 {
         float tx, ty;
@@ -860,10 +932,14 @@ static int update(void *ud)
         bungee_input(cur, pushed, panel_open, dt, mx, my, mac_ready, cur_mode == MODE_LANDER);
 #ifndef MARBLE_TIMING           /* (there, timing_input() drives the mouse) */
         if (mac_ready) {
-                if (cur_mode == MODE_LANDER)
-                        step_lander(dt, cur, panel_open);
-                else
-                        step_marble(dt);
+                if ((pushed & kButtonA) && !panel_open)
+                        snag_press();
+                if (!snag_step(dt)) {
+                        if (cur_mode == MODE_LANDER)
+                                step_lander(dt, cur, panel_open);
+                        else
+                                step_marble(dt);
+                }
                 mac_set_mouse((int)mx, (int)my);
         }
         umac_mouse(0, 0, (cur & kButtonA) ? 1 : 0);
