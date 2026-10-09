@@ -318,28 +318,22 @@ static void update_extent(void)
         cursor_extent(&c, cursor_rotation(&c), &ext_x0, &ext_x1, &ext_y0, &ext_y1);
 }
 
-/* Click snag, a fishtail: pressing the button catches the pointer's tip
- * on the screen.  The arrow's weight sits SNAG_ARM px behind the tip, so
- * its momentum turns into a swing round the caught tip (what was moving
- * along the arrow mostly stops dead; a share of it kicks the tail out
- * sideways anyway).  After tune.snag_time it lets go, and flies off the
- * way the tail was swinging.  A second press within the Mac's
- * double-click time lands on exactly the first press's pixel.
+/* Click snag: pressing the button catches the pointer's tip on the
+ * screen for a moment (tune.snag_time), and the arrow's own momentum
+ * flips it round that pivot.  Then it lets go, carrying on as it was, and
+ * swings back to point where it's going.  A second press within the
+ * Mac's double-click time lands on exactly the first press's pixel.
  */
-#define SNAG_ARM        9.0f    /* px from the tip to the arrow's weight */
-#define SNAG_KICK       0.6f    /* share of along-the-arrow speed that becomes swing */
-#define SNAG_DAMP       2.0f    /* swing damping while caught, 1/s */
-#define SNAG_KEEP       0.85f   /* share of the swing speed it leaves with */
-#define LM_DOUBLETIME   0x2f0   /* long: double-click time, ticks */
-
 static struct {
-        float t;                /* time left caught */
-        float x, y;             /* the caught tip */
-        float th;               /* direction from the tip to the weight */
-        float w;                /* swing, rad/s */
+        float t;                /* time left pinned */
+        float x, y;             /* the pinned hotspot */
+        float vx, vy;           /* momentum to carry on with */
+        float a0, a1;           /* the flip: from, to */
         float since;            /* time since the last press */
         float px, py;           /* where the last press landed */
 } snag = { .since = 1e9f };
+
+#define LM_DOUBLETIME   0x2f0   /* long: double-click time, ticks */
 
 static void snag_press(void)
 {
@@ -359,18 +353,14 @@ static void snag_press(void)
         if (tune.snag_time <= 0)
                 return;
         if (snag.t <= 0) {
-                /* Caught: split the velocity along the arm (tip to weight)
-                 * and across it; across becomes swing.
+                /* Caught: the tail keeps going, so the arrow swings right
+                 * round its tip, whichever way the motion pushes it.
                  */
-                snag.th = angle + (float)M_PI;
-                float rx = cosf(snag.th), ry = sinf(snag.th);
-                float along = vx * rx + vy * ry;
-                float across = -vx * ry + vy * rx;
-                float kick = SNAG_KICK * fabsf(along);
-                snag.w = (across + (across >= 0 ? kick : -kick)) / SNAG_ARM;
-                /* at most about a turn while caught */
-                float wmax = 2 * (float)M_PI / fmaxf(tune.snag_time, 0.05f);
-                snag.w = fmaxf(-wmax, fminf(wmax, snag.w));
+                snag.vx = vx;
+                snag.vy = vy;
+                float cross = cosf(angle) * vy - sinf(angle) * vx;
+                snag.a0 = angle;
+                snag.a1 = angle + (cross >= 0 ? (float)M_PI : -(float)M_PI);
         }
         snag.x = mx;
         snag.y = my;
@@ -378,7 +368,7 @@ static void snag_press(void)
         vx = vy = 0;
 }
 
-/* Returns 1 while caught (the physics step is skipped) */
+/* Returns 1 while pinned (the physics step is skipped) */
 static int snag_step(float dt)
 {
         snag.since += dt;
@@ -387,14 +377,13 @@ static int snag_step(float dt)
         snag.t -= dt;
         mx = snag.x;
         my = snag.y;
-        snag.w *= expf(-SNAG_DAMP * dt);
-        snag.th = remainderf(snag.th + snag.w * dt, 2 * (float)M_PI);
-        angle = remainderf(snag.th + (float)M_PI, 2 * (float)M_PI);
+        /* A quick swing with a little overshoot, settling at the flip */
+        float u = fminf(1, 1 - snag.t / fmaxf(tune.snag_time, 1e-3f));
+        float e = 1 + 2.2f * powf(u - 1, 3) + 1.2f * powf(u - 1, 2);
+        angle = remainderf(snag.a0 + (snag.a1 - snag.a0) * e, 2 * (float)M_PI);
         if (snag.t <= 0) {
-                /* Let go: off the way the weight was swinging */
-                float sp = snag.w * SNAG_ARM * SNAG_KEEP;
-                vx = -sinf(snag.th) * sp;
-                vy = cosf(snag.th) * sp;
+                vx = snag.vx;   /* let go: carry on */
+                vy = snag.vy;
                 return 0;
         }
         vx = vy = 0;
